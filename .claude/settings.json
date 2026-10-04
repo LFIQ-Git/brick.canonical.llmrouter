@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && { [ -d node_modules ] || npm ci --silent; } && echo 'canonical-llm: npm run typecheck | npm test | npm run check:dist | python3 test_brick_llm.py'"
+          }
+        ]
+      }
+    ]
+  }
+}

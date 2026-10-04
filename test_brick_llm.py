@@ -226,6 +226,58 @@ def test_retry_constants() -> None:
     assert L.BREAKER_COOLDOWN_MS == 60_000
 
 
+# ── SDK connection errors are transient ──────────────────────────────────
+class APIConnectionError(Exception):
+    """Stand-in with the SDK class name (openai / anthropic both use it)."""
+
+
+class APITimeoutError(APIConnectionError):
+    """Stand-in for the SDK timeout subclass."""
+
+
+def test_transient_sdk_connection_errors() -> None:
+    assert L.is_transient_llm_error(APIConnectionError("Connection error.")) is True
+    assert L.is_transient_llm_error(APITimeoutError("Request timed out.")) is True
+
+
+# ── error redaction ──────────────────────────────────────────────────────
+def test_redact_err_removes_secrets_and_caps_length() -> None:
+    with env(OCP_API_KEY="test-ocp-key-0123456789", ANTHROPIC_API_KEY="test-anth-key-0123456789"):
+        raw = (
+            "key test-ocp-key-0123456789 anth test-anth-key-0123456789 "
+            "tok sk-ant-api03-AAAAAAAAAAAAAAAA Bearer abcdefghijklmnop123456 "
+            "api_key=zzzzzzzzzzzz\n" + "x" * 2000
+        )
+        out = L._redact_err(RuntimeError(raw))
+        for secret in (
+            "test-ocp-key-0123456789", "test-anth-key-0123456789",
+            "sk-ant-api03", "abcdefghijklmnop123456", "zzzzzzzzzzzz",
+        ):
+            assert secret not in out, out
+        assert len(out) <= 300
+        assert "\n" not in out
+
+
+# ── OCP headers parity with llm.ts ───────────────────────────────────────
+def test_ocp_default_headers() -> None:
+    with env(OCP_CF_ACCESS_CLIENT_ID="cf-id", OCP_CF_ACCESS_CLIENT_SECRET="cf-secret", LLM_USER_AGENT=None):
+        h = L._ocp_default_headers()
+        assert h["CF-Access-Client-Id"] == "cf-id"
+        assert h["CF-Access-Client-Secret"] == "cf-secret"
+        assert not h["User-Agent"].lower().startswith("openai")
+    with env(OCP_CF_ACCESS_CLIENT_ID=None, OCP_CF_ACCESS_CLIENT_SECRET=None):
+        assert "CF-Access-Client-Id" not in L._ocp_default_headers()
+
+
+def test_ocp_client_options() -> None:
+    with env(LLM_OCP_TIMEOUT_MS=None, LLM_OCP_MAX_RETRIES=None):
+        assert L._ocp_client_options() == {"timeout": 180.0, "max_retries": 1}
+    with env(LLM_OCP_TIMEOUT_MS="2500", LLM_OCP_MAX_RETRIES="0"):
+        assert L._ocp_client_options() == {"timeout": 2.5, "max_retries": 0}
+    with env(LLM_OCP_TIMEOUT_MS="junk", LLM_OCP_MAX_RETRIES="-1"):
+        assert L._ocp_client_options() == {"timeout": 180.0, "max_retries": 1}
+
+
 # ── plain-script runner (no pytest required) ─────────────────────────────
 def _run_all() -> int:
     tests = [
