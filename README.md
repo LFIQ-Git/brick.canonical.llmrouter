@@ -37,7 +37,15 @@ together** → push → bump the SHA pin in each consumer. CI runs
   cacheable minimum bill at ~10% of input price.
 - **Model tiers** — `fast` / `balanced` / `deep` via `MODEL_TIERS`; callers
   pass `tier` instead of pinning a model ID.
+- **Bounded failover** — since v0.5.0 the OCP and ocp-fallback clients time
+  out after 180 s with 1 SDK retry (SDK default was 10 min with 2 retries,
+  so a hung Win-PC could stall a call ~30 min before failover). SDK
+  connection errors and timeouts count as transient for `chatWithRetry()`.
 - **Observability** — one `llm.call` structured log line per call. Since
+  v0.5.0 the `err` field is redacted (configured key values, `sk-…` and
+  `Bearer …` tokens removed) and capped at 300 characters; the error the
+  caller receives is unchanged. Falls back to `console.log` where
+  `process.stdout` is unavailable. Since
   v0.3.0 the Anthropic leg also logs `cacheWrite` / `cacheRead` (prompt-cache
   token counts), and `ChatUsage` carries `cache_creation_input_tokens` /
   `cache_read_input_tokens`.
@@ -51,6 +59,7 @@ together** → push → bump the SHA pin in each consumer. CI runs
 | `02-brick.command` `apps/collect` | `lib/llm.ts` | workspace `package.json`; lock entries live in **command's root `package-lock.json`** |
 | `02-brick.command` `apps/leasing` | `lib/llm.ts` | same — command root lockfile |
 | `02-brick.command` `apps/web` | `lib/llm.ts` | same — command root lockfile |
+| `brick.registry` | — | own `package.json` + lockfile |
 
 After bumping the three command workspace pins, run
 `npm install --package-lock-only` at the **command repo root** (not in the
@@ -72,8 +81,17 @@ Layer-0 shim, except files carrying a `Layer-1 exception:` marker comment.
 `brick_llm.py` (in this repo) is the Python port of `llm.ts` for the family's
 Python work — same providers, tiers, retry policy, circuit breaker, cache
 counters, and `llm.call` log shape. It currently lacks the ocp-fallback leg
-(OCP → Anthropic only). Tests: `python3 test_brick_llm.py` — pure functions,
-no network, no SDKs needed. When `llm.ts` changes, change `brick_llm.py` with
+(OCP → Anthropic only). Since v0.5.0 it sends the same User-Agent and
+Cloudflare Access headers to OCP as `llm.ts`, and has the same timeouts and
+log redaction. Tests: `python3 test_brick_llm.py` — pure functions, no
+network, no SDKs needed.
+
+## Tests
+
+`npm test` runs `test/llm.test.mjs` against the compiled `dist/llm.js` with
+a local mock server standing in for OCP, ocp-fallback and Anthropic: the
+failover order, breaker, timeouts, retry classification, log redaction and
+the exported API. Build first (`npm run build`). CI runs it on every PR. When `llm.ts` changes, change `brick_llm.py` with
 it.
 
 ## Vault mirror
@@ -92,6 +110,9 @@ service token sent to the OCP gateway. `OCP_FALLBACK_BASE_URL`,
 leg. `LLM_PROVIDER=anthropic` forces the direct leg. `LLM_MODEL_FAST` /
 `LLM_MODEL_BALANCED` / `LLM_MODEL_DEEP` override tier model IDs;
 `EXTRACTION_MODEL` overrides the default model. `LLM_APP_NAME` /
-`LLM_USER_AGENT` tag outbound requests.
+`LLM_USER_AGENT` tag outbound requests. `LLM_OCP_TIMEOUT_MS` (default
+180000) and `LLM_OCP_MAX_RETRIES` (default 1) bound both OCP-shaped legs;
+`LLM_ANTHROPIC_TIMEOUT_MS` / `LLM_ANTHROPIC_MAX_RETRIES` override the
+Anthropic SDK defaults only when set.
 
 Architecture + rollout tracker: `02-brick.intel/docs/llm-architecture.md`.
