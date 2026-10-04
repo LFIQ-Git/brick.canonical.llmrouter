@@ -19,9 +19,15 @@ before(async () => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
-      const key = req.url.split("/")[1];
-      if (key in hits) hits[key] += 1;
-      const h = handlers[key];
+      // Resolve the leg from a fixed set; never index by the raw URL segment.
+      const seg = req.url.split("/")[1];
+      const key = seg === "ocp" || seg === "fb" || seg === "anth" ? seg : null;
+      if (key === null) {
+        res.writeHead(404).end();
+        return;
+      }
+      hits[key] += 1;
+      const h = key === "ocp" ? handlers.ocp : key === "fb" ? handlers.fb : handlers.anth;
       if (!h) {
         res.writeHead(404).end();
         return;
