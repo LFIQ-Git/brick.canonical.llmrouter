@@ -12,7 +12,7 @@ on:
 
 jobs:
   verify:
-    name: typecheck · dist · python tests
+    name: typecheck · dist · tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -25,5 +25,7 @@ jobs:
       - run: npm run typecheck
       - name: dist/ is up to date (run `npm run build` and commit if this fails)
         run: npm run check:dist
+      - name: Router tests (failover, timeouts, retry, log redaction)
+        run: npm test
       - name: Python twin tests
         run: python3 test_brick_llm.py

@@ -36,15 +36,19 @@ lazily constructs its clients.
 
 Install deps: ``pip install openai anthropic`` (see requirements.txt).
 
-Env contract (identical to llm.ts):
-  OCP_BASE_URL, OCP_API_KEY, ANTHROPIC_API_KEY, LLM_PROVIDER,
-  LLM_MODEL_FAST, LLM_MODEL_BALANCED, LLM_MODEL_DEEP, EXTRACTION_MODEL.
+Env contract (same names as llm.ts; no ocp-fallback leg yet):
+  OCP_BASE_URL, OCP_API_KEY, OCP_CF_ACCESS_CLIENT_ID,
+  OCP_CF_ACCESS_CLIENT_SECRET, ANTHROPIC_API_KEY, LLM_PROVIDER,
+  LLM_MODEL_FAST, LLM_MODEL_BALANCED, LLM_MODEL_DEEP, EXTRACTION_MODEL,
+  LLM_USER_AGENT, LLM_OCP_TIMEOUT_MS, LLM_OCP_MAX_RETRIES,
+  LLM_ANTHROPIC_TIMEOUT_MS, LLM_ANTHROPIC_MAX_RETRIES.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -93,6 +97,61 @@ def get_provider() -> Provider:
     return "anthropic"
 
 
+# ── per-leg timeouts + OCP headers ───────────────────────────────────────
+# SDK defaults are a 10-minute timeout with 2 internal retries, so a hung
+# Win-PC could hold a call ~30 minutes before failover. Same defaults as
+# llm.ts: OCP 180 s / 1 retry; Anthropic keeps SDK defaults unless set.
+OCP_TIMEOUT_MS_DEFAULT = 180_000
+OCP_MAX_RETRIES_DEFAULT = 1
+
+
+def _env_int(name: str) -> Optional[int]:
+    """Non-negative integer from env, or None when unset or invalid."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        n = int(float(raw))
+    except ValueError:
+        return None
+    return n if n >= 0 else None
+
+
+def _ocp_client_options() -> Dict[str, Any]:
+    """OpenAI-SDK kwargs for the OCP client (timeout in seconds)."""
+    ms = _env_int("LLM_OCP_TIMEOUT_MS")
+    retries = _env_int("LLM_OCP_MAX_RETRIES")
+    return {
+        "timeout": (ms if ms is not None else OCP_TIMEOUT_MS_DEFAULT) / 1000.0,
+        "max_retries": retries if retries is not None else OCP_MAX_RETRIES_DEFAULT,
+    }
+
+
+def _anthropic_client_options() -> Dict[str, Any]:
+    """Anthropic-SDK kwargs — only what env overrides; SDK defaults otherwise."""
+    opts: Dict[str, Any] = {}
+    ms = _env_int("LLM_ANTHROPIC_TIMEOUT_MS")
+    retries = _env_int("LLM_ANTHROPIC_MAX_RETRIES")
+    if ms is not None:
+        opts["timeout"] = ms / 1000.0
+    if retries is not None:
+        opts["max_retries"] = retries
+    return opts
+
+
+def _ocp_default_headers() -> Dict[str, str]:
+    """Headers OCP needs, matching llm.ts: a non-OpenAI User-Agent (the
+    gateway blocks the SDK default) and the Cloudflare Access service-token
+    pair (without it Access redirects to an SSO page)."""
+    headers = {"User-Agent": os.environ.get("LLM_USER_AGENT", "brick-canonical-llm/0.1")}
+    cf_id = os.environ.get("OCP_CF_ACCESS_CLIENT_ID")
+    cf_secret = os.environ.get("OCP_CF_ACCESS_CLIENT_SECRET")
+    if cf_id and cf_secret:
+        headers["CF-Access-Client-Id"] = cf_id
+        headers["CF-Access-Client-Secret"] = cf_secret
+    return headers
+
+
 # ── lazily-constructed SDK clients ───────────────────────────────────────
 _oai: Any = None
 _anthropic: Any = None
@@ -112,7 +171,12 @@ def _get_openai() -> Any:
         )
     from openai import OpenAI  # lazy import — see module docstring
 
-    _oai = OpenAI(api_key=api_key, base_url=base_url)
+    _oai = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        default_headers=_ocp_default_headers(),
+        **_ocp_client_options(),
+    )
     return _oai
 
 
@@ -129,7 +193,7 @@ def _get_anthropic() -> Any:
         )
     from anthropic import Anthropic  # lazy import — see module docstring
 
-    _anthropic = Anthropic(api_key=api_key)
+    _anthropic = Anthropic(api_key=api_key, **_anthropic_client_options())
     return _anthropic
 
 
@@ -228,6 +292,58 @@ def _log_call(
         sys.stdout.write(f"llm.call {json.dumps(rec)}\n")
     except Exception:  # noqa: BLE001 — logging must never throw
         pass
+
+
+# ── error redaction — nothing secret reaches a log line ──────────────────
+_SECRET_ENV_NAMES = (
+    "OCP_API_KEY",
+    "OCP_CF_ACCESS_CLIENT_ID",
+    "OCP_CF_ACCESS_CLIENT_SECRET",
+    "OCP_FALLBACK_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
+_ERR_MAX_CHARS = 300
+_TOKEN_PATTERNS = (
+    (re.compile(r"sk-[A-Za-z0-9_-]{8,}"), "[redacted]"),
+    (re.compile(r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}", re.I), r"\1 [redacted]"),
+    (
+        re.compile(
+            r"\b(api[_-]?key|x-api-key|authorization|cf-access-client-secret|cf-access-client-id)"
+            r"([\"']?\s*[:=]\s*[\"']?)[^\s\"',}]{6,}",
+            re.I,
+        ),
+        r"\1\2[redacted]",
+    ),
+)
+
+
+def _redact_err(e: Any) -> str:
+    """Error text safe to log, matching llm.ts ``redactErr``: configured
+    secret values and token-shaped strings removed, whitespace collapsed,
+    capped at 300 characters."""
+    try:
+        s = str(e)
+        # Surface the network cause (e.g. ConnectError / errno) so a dead
+        # leg is obvious in the log; SDK messages say only "Connection error.".
+        cur = getattr(e, "__cause__", None)
+        for _ in range(5):
+            if cur is None:
+                break
+            label = type(cur).__name__
+            if label not in s:
+                s = f"{s} ({label}: {cur})"
+                break
+            cur = getattr(cur, "__cause__", None)
+    except Exception:  # noqa: BLE001
+        s = "[unprintable error]"
+    for name in _SECRET_ENV_NAMES:
+        v = os.environ.get(name)
+        if v and len(v) >= 6:
+            s = s.replace(v, "[redacted]")
+    for pattern, replacement in _TOKEN_PATTERNS:
+        s = pattern.sub(replacement, s)
+    s = " ".join(s.split())
+    return s if len(s) <= _ERR_MAX_CHARS else s[: _ERR_MAX_CHARS - 1] + "…"
 
 
 # ── circuit breaker — skip a flapping OCP proxy for a cooldown ────────────
@@ -392,7 +508,7 @@ def _run_chat(args: ChatArgs) -> ChatResult:
             )
         except Exception as e:  # noqa: BLE001 — routed to failover / re-raised
             _note_ocp_result(False)
-            err = str(e)
+            err = _redact_err(e)
             if not anthropic_available:
                 _log_call(
                     "ocp", model, tier, int(_now_ms() - started), ok=False, err=err
@@ -423,7 +539,7 @@ def _run_chat(args: ChatArgs) -> ChatResult:
             text=out.text, usage=out.usage, raw=out.raw, provider="anthropic"
         )
     except Exception as e:  # noqa: BLE001 — re-raised after logging
-        err = str(e)
+        err = _redact_err(e)
         _log_call(
             "anthropic",
             model,
@@ -466,6 +582,11 @@ def is_transient_llm_error(e: Any) -> bool:
     """
     if e is None or not isinstance(e, BaseException):
         return False
+    # SDK connection failures and timeouts carry no status or code. Both SDKs
+    # name them APIConnectionError / APITimeoutError; match by class name so
+    # the SDKs stay lazily imported.
+    if any(c.__name__ in ("APIConnectionError", "APITimeoutError") for c in type(e).__mro__):
+        return True
     status = getattr(e, "status", None)
     if status is None:
         status = getattr(e, "status_code", None)

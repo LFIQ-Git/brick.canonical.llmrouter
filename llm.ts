@@ -55,6 +55,54 @@ export function getProvider(): Provider {
   return "anthropic";
 }
 
+// ── per-leg timeouts ────────────────────────────────────────────────────
+// The SDKs default to a 10-minute timeout with 2 internal retries. On the OCP
+// legs that meant a hung Win-PC could hold a call for ~30 minutes before the
+// chain moved on. The OCP-shaped legs get a shorter budget so failover is
+// prompt; the Anthropic leg keeps SDK defaults unless overridden.
+const OCP_TIMEOUT_MS_DEFAULT = 180_000;
+const OCP_MAX_RETRIES_DEFAULT = 1;
+
+function envInt(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
+}
+
+/** Timeout + retry settings for the OCP and ocp-fallback clients.
+ *  Env: LLM_OCP_TIMEOUT_MS (default 180000), LLM_OCP_MAX_RETRIES (default 1). */
+function ocpClientOptions(): { timeout: number; maxRetries: number } {
+  return {
+    timeout: envInt("LLM_OCP_TIMEOUT_MS") ?? OCP_TIMEOUT_MS_DEFAULT,
+    maxRetries: envInt("LLM_OCP_MAX_RETRIES") ?? OCP_MAX_RETRIES_DEFAULT,
+  };
+}
+
+/** ocp-fallback client settings: LLM_OCP_FALLBACK_TIMEOUT_MS /
+ *  LLM_OCP_FALLBACK_MAX_RETRIES when set, otherwise the OCP values. An
+ *  unreachable fallback host (DNS failure, refused connection) fails in
+ *  under a second either way; the timeout only matters for a host that
+ *  accepts the connection and then hangs. */
+function ocpFallbackClientOptions(): { timeout: number; maxRetries: number } {
+  const base = ocpClientOptions();
+  return {
+    timeout: envInt("LLM_OCP_FALLBACK_TIMEOUT_MS") ?? base.timeout,
+    maxRetries: envInt("LLM_OCP_FALLBACK_MAX_RETRIES") ?? base.maxRetries,
+  };
+}
+
+/** Anthropic client overrides — only what the env sets; SDK defaults otherwise.
+ *  Env: LLM_ANTHROPIC_TIMEOUT_MS, LLM_ANTHROPIC_MAX_RETRIES. */
+function anthropicClientOptions(): { timeout?: number; maxRetries?: number } {
+  const opts: { timeout?: number; maxRetries?: number } = {};
+  const timeout = envInt("LLM_ANTHROPIC_TIMEOUT_MS");
+  const maxRetries = envInt("LLM_ANTHROPIC_MAX_RETRIES");
+  if (timeout !== undefined) opts.timeout = timeout;
+  if (maxRetries !== undefined) opts.maxRetries = maxRetries;
+  return opts;
+}
+
 let _oai: OpenAI | null = null;
 let _oaiFallback: OpenAI | null = null;
 let _anthropic: Anthropic | null = null;
@@ -84,7 +132,7 @@ function getOpenAI(): OpenAI {
     defaultHeaders["CF-Access-Client-Id"] = cfId;
     defaultHeaders["CF-Access-Client-Secret"] = cfSecret;
   }
-  _oai = new OpenAI({ apiKey, baseURL, defaultHeaders });
+  _oai = new OpenAI({ apiKey, baseURL, defaultHeaders, ...ocpClientOptions() });
   return _oai;
 }
 
@@ -107,6 +155,7 @@ function getOpenAIFallback(): OpenAI {
     baseURL,
     // X-App-Name lets the fallback proxy log which app a call came from.
     defaultHeaders: { "X-App-Name": appName },
+    ...ocpFallbackClientOptions(),
   });
   return _oaiFallback;
 }
@@ -119,7 +168,7 @@ function getAnthropic(): Anthropic {
       "ANTHROPIC_API_KEY not set. Set OCP_BASE_URL to use the subscription proxy instead.",
     );
   }
-  _anthropic = new Anthropic({ apiKey });
+  _anthropic = new Anthropic({ apiKey, ...anthropicClientOptions() });
   return _anthropic;
 }
 
@@ -175,11 +224,71 @@ function logCall(rec: {
   cacheRead?: number;
 }): void {
   // One structured line per call — cheap to grep / ship to a log drain later.
+  // Falls back to console.log on runtimes without a usable process.stdout
+  // (e.g. Cloudflare Workers without nodejs_compat).
   try {
-    process.stdout.write(`llm.call ${JSON.stringify({ ...rec, ts: new Date().toISOString() })}\n`);
+    const line = `llm.call ${JSON.stringify({ ...rec, ts: new Date().toISOString() })}`;
+    try {
+      process.stdout.write(`${line}\n`);
+    } catch {
+      console.log(line);
+    }
   } catch {
     /* logging must never throw */
   }
+}
+
+// ── error redaction — nothing secret reaches a log line ──────────────────
+const SECRET_ENV_NAMES = [
+  "OCP_API_KEY",
+  "OCP_CF_ACCESS_CLIENT_ID",
+  "OCP_CF_ACCESS_CLIENT_SECRET",
+  "OCP_FALLBACK_API_KEY",
+  "ANTHROPIC_API_KEY",
+];
+const ERR_MAX_CHARS = 300;
+// [pattern, replacement] — replacements keep the label, drop the value.
+const TOKEN_PATTERNS: Array<[RegExp, string]> = [
+  [/sk-[A-Za-z0-9_-]{8,}/g, "[redacted]"], // Anthropic / OpenAI-style keys
+  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]"], // auth header values
+  [
+    /\b(api[_-]?key|x-api-key|authorization|cf-access-client-secret|cf-access-client-id)(["']?\s*[:=]\s*["']?)[^\s"',}]{6,}/gi,
+    "$1$2[redacted]",
+  ],
+];
+
+/** First string `code` found walking the `cause` chain (max 5 levels). */
+function rootCauseCode(e: unknown): string | undefined {
+  let cur: unknown = e;
+  for (let i = 0; i < 5 && cur && typeof cur === "object"; i++) {
+    const code = (cur as { code?: unknown }).code;
+    if (typeof code === "string" && code) return code;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/** Error text safe to log: configured secret values and token-shaped strings
+ *  removed, whitespace collapsed, capped at ERR_MAX_CHARS. */
+function redactErr(e: unknown): string {
+  let s: string;
+  try {
+    s = e instanceof Error ? e.message : String(e);
+    // SDK connection errors say only "Connection error."; surface the
+    // network cause code (ENOTFOUND, ECONNREFUSED, ...) so a dead leg is
+    // obvious in the log.
+    const code = rootCauseCode(e);
+    if (code && !s.includes(code)) s = `${s} (${code})`;
+  } catch {
+    s = "[unprintable error]";
+  }
+  for (const name of SECRET_ENV_NAMES) {
+    const v = process.env[name];
+    if (v && v.length >= 6) s = s.split(v).join("[redacted]");
+  }
+  for (const [re, replacement] of TOKEN_PATTERNS) s = s.replace(re, replacement);
+  s = s.replace(/\s+/g, " ").trim();
+  return s.length > ERR_MAX_CHARS ? `${s.slice(0, ERR_MAX_CHARS - 1)}…` : s;
 }
 
 // ── circuit breakers — skip a flapping proxy for a cooldown ──────────────
@@ -319,7 +428,7 @@ async function runChat(args: ChatArgs): Promise<ChatResult> {
       return { ...out, provider: "ocp" };
     } catch (e) {
       _ocpBreaker.note(false);
-      const err = e instanceof Error ? e.message : String(e);
+      const err = redactErr(e);
       logCall({ provider: "ocp", model, tier, latencyMs: Date.now() - t, ok: false, err });
       if (!fallbackAvailable && !anthropicAvailable) throw e;
       // fall through
@@ -336,7 +445,7 @@ async function runChat(args: ChatArgs): Promise<ChatResult> {
       return { ...out, provider: "ocp-fallback" };
     } catch (e) {
       _ocpFallbackBreaker.note(false);
-      const err = e instanceof Error ? e.message : String(e);
+      const err = redactErr(e);
       logCall({ provider: "ocp-fallback", model, tier, latencyMs: Date.now() - t, ok: false, failedOver: true, err });
       if (!anthropicAvailable) throw e;
       // fall through
@@ -360,7 +469,7 @@ async function runChat(args: ChatArgs): Promise<ChatResult> {
     });
     return { ...out, provider: "anthropic" };
   } catch (e) {
-    const err = e instanceof Error ? e.message : String(e);
+    const err = redactErr(e);
     logCall({ provider: "anthropic", model, tier, latencyMs: Date.now() - t, ok: false, failedOver: fellOver, err });
     throw e;
   }
@@ -389,6 +498,10 @@ const LLM_BACKOFF_MS = [500, 1500, 4000];
 
 function isTransientLLMError(e: unknown): boolean {
   if (!e || typeof e !== "object") return false;
+  // SDK connection failures and timeouts carry no HTTP status or Node error
+  // code — classify them by class (APIConnectionTimeoutError extends
+  // APIConnectionError in both SDKs).
+  if (e instanceof OpenAI.APIConnectionError || e instanceof Anthropic.APIConnectionError) return true;
   const status = (e as { status?: number }).status;
   if (status === 429) return true;
   if (typeof status === "number" && status >= 500 && status < 600) return true;

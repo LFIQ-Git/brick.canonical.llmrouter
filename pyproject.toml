@@ -1,7 +1,7 @@
 [project]
 name = "lfiq-canonical-llm"
 version = "0.1.0"
-description = "Canonical LLM router for the BRICK app family — OCP→Anthropic→Ollama→rules fallback chain."
+description = "Canonical LLM router for the BRICK app family (Python twin of llm.ts): OCP then Anthropic failover."
 requires-python = ">=3.10"
 dependencies = [
   "anthropic>=0.30.0",
