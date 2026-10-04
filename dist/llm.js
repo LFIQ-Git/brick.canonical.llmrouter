@@ -72,6 +72,18 @@ function ocpClientOptions() {
         maxRetries: envInt("LLM_OCP_MAX_RETRIES") ?? OCP_MAX_RETRIES_DEFAULT,
     };
 }
+/** ocp-fallback client settings: LLM_OCP_FALLBACK_TIMEOUT_MS /
+ *  LLM_OCP_FALLBACK_MAX_RETRIES when set, otherwise the OCP values. An
+ *  unreachable fallback host (DNS failure, refused connection) fails in
+ *  under a second either way; the timeout only matters for a host that
+ *  accepts the connection and then hangs. */
+function ocpFallbackClientOptions() {
+    const base = ocpClientOptions();
+    return {
+        timeout: envInt("LLM_OCP_FALLBACK_TIMEOUT_MS") ?? base.timeout,
+        maxRetries: envInt("LLM_OCP_FALLBACK_MAX_RETRIES") ?? base.maxRetries,
+    };
+}
 /** Anthropic client overrides — only what the env sets; SDK defaults otherwise.
  *  Env: LLM_ANTHROPIC_TIMEOUT_MS, LLM_ANTHROPIC_MAX_RETRIES. */
 function anthropicClientOptions() {
@@ -131,7 +143,7 @@ function getOpenAIFallback() {
         baseURL,
         // X-App-Name lets the fallback proxy log which app a call came from.
         defaultHeaders: { "X-App-Name": appName },
-        ...ocpClientOptions(),
+        ...ocpFallbackClientOptions(),
     });
     return _oaiFallback;
 }
@@ -181,12 +193,29 @@ const TOKEN_PATTERNS = [
         "$1$2[redacted]",
     ],
 ];
+/** First string `code` found walking the `cause` chain (max 5 levels). */
+function rootCauseCode(e) {
+    let cur = e;
+    for (let i = 0; i < 5 && cur && typeof cur === "object"; i++) {
+        const code = cur.code;
+        if (typeof code === "string" && code)
+            return code;
+        cur = cur.cause;
+    }
+    return undefined;
+}
 /** Error text safe to log: configured secret values and token-shaped strings
  *  removed, whitespace collapsed, capped at ERR_MAX_CHARS. */
 function redactErr(e) {
     let s;
     try {
         s = e instanceof Error ? e.message : String(e);
+        // SDK connection errors say only "Connection error."; surface the
+        // network cause code (ENOTFOUND, ECONNREFUSED, ...) so a dead leg is
+        // obvious in the log.
+        const code = rootCauseCode(e);
+        if (code && !s.includes(code))
+            s = `${s} (${code})`;
     }
     catch {
         s = "[unprintable error]";

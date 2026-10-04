@@ -258,6 +258,20 @@ def test_redact_err_removes_secrets_and_caps_length() -> None:
         assert "\n" not in out
 
 
+def test_redact_err_includes_network_cause() -> None:
+    class ConnectError(Exception):
+        pass
+
+    try:
+        try:
+            raise ConnectError("[Errno 8] nodename nor servname provided")
+        except ConnectError as inner:
+            raise APIConnectionError("Connection error.") from inner
+    except APIConnectionError as e:
+        out = L._redact_err(e)
+    assert "Connection error." in out and "ConnectError" in out, out
+
+
 # ── OCP headers parity with llm.ts ───────────────────────────────────────
 def test_ocp_default_headers() -> None:
     with env(OCP_CF_ACCESS_CLIENT_ID="cf-id", OCP_CF_ACCESS_CLIENT_SECRET="cf-secret", LLM_USER_AGENT=None):

@@ -31,6 +31,8 @@ Written 2026-10-03 against commit e257290. Unattended fleet run: Risk, Broken pr
 
 ## Deferred to owner
 
+- ocp-fallback is not deployed (`ocp-fallback.lfiq.app` has no DNS record and no Vercel project): redeploy it, or point the router at the Anthropic API directly by unsetting `OCP_FALLBACK_BASE_URL` / `OCP_FALLBACK_API_KEY` in consumers. The router now fails past it in under a second.
+
 - Turn on branch protection for `main` (repo settings).
 - Add the ocp-fallback leg to `brick_llm.py`.
 - Decide whether 4xx caller errors should skip failover and the breaker.

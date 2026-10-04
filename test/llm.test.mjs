@@ -48,7 +48,7 @@ const ENV_KEYS = [
   "OCP_BASE_URL", "OCP_API_KEY", "OCP_CF_ACCESS_CLIENT_ID", "OCP_CF_ACCESS_CLIENT_SECRET",
   "OCP_FALLBACK_BASE_URL", "OCP_FALLBACK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
   "LLM_PROVIDER", "LLM_OCP_TIMEOUT_MS", "LLM_OCP_MAX_RETRIES", "LLM_ANTHROPIC_TIMEOUT_MS",
-  "LLM_ANTHROPIC_MAX_RETRIES",
+  "LLM_ANTHROPIC_MAX_RETRIES", "LLM_OCP_FALLBACK_TIMEOUT_MS", "LLM_OCP_FALLBACK_MAX_RETRIES",
 ];
 
 beforeEach(() => {
@@ -290,6 +290,55 @@ test("logging falls back to console.log when stdout.write is unusable", async ()
     console.log = origLog;
   }
   assert.equal(logged.filter((s) => s.startsWith("llm.call ")).length, 1);
+});
+
+/** A localhost port with nothing listening: connections are refused. */
+async function deadPort() {
+  const srv = http.createServer();
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const port = srv.address().port;
+  await new Promise((r) => srv.close(r));
+  return port;
+}
+
+test("unreachable ocp-fallback fails fast and lands on Anthropic", async () => {
+  chainEnv();
+  // Default retry settings: the dead host must still fail in well under 5 s.
+  delete process.env.LLM_OCP_MAX_RETRIES;
+  process.env.OCP_FALLBACK_BASE_URL = `http://127.0.0.1:${await deadPort()}/v1`;
+  handlers.ocp = fail(400, "ocp rejects");
+  handlers.anth = anthOk("anth-after-dead-fallback");
+  const L = await load();
+  const t = Date.now();
+  const { result, lines } = await captureLogs(() => L.chatDetailed(ARGS));
+  assert.ok(Date.now() - t < 5000, `took ${Date.now() - t}ms`);
+  assert.equal(result.provider, "anthropic");
+  const fb = lines.find((l) => l.provider === "ocp-fallback");
+  assert.equal(fb.ok, false);
+  assert.match(fb.err, /ECONNREFUSED/);
+});
+
+test("OCP and fallback both down with no Anthropic key: throws, both legs logged", async () => {
+  chainEnv();
+  delete process.env.ANTHROPIC_API_KEY;
+  process.env.OCP_BASE_URL = `http://127.0.0.1:${await deadPort()}/v1`;
+  process.env.OCP_FALLBACK_BASE_URL = `http://127.0.0.1:${await deadPort()}/v1`;
+  const L = await load();
+  const { error, lines } = await captureLogs(() => L.chat(ARGS));
+  assert.ok(error, "must throw, not hang or return empty text");
+  assert.deepEqual(lines.map((l) => [l.provider, l.ok]), [["ocp", false], ["ocp-fallback", false]]);
+});
+
+test("dead ocp-fallback trips its own breaker and is skipped", async () => {
+  chainEnv();
+  process.env.OCP_FALLBACK_BASE_URL = `http://127.0.0.1:${await deadPort()}/v1`;
+  process.env.LLM_OCP_FALLBACK_MAX_RETRIES = "0";
+  handlers.ocp = fail(500);
+  handlers.anth = anthOk("anth");
+  const L = await load();
+  for (let i = 0; i < 3; i++) await captureLogs(() => L.chat(ARGS));
+  const { lines } = await captureLogs(() => L.chat(ARGS));
+  assert.deepEqual(lines.map((l) => l.provider), ["anthropic"], "OCP and fallback breakers both open");
 });
 
 test("exported API surface is unchanged", async () => {

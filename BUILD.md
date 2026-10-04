@@ -36,3 +36,4 @@ _(empty)_
 - Wrote 13 `node:test` cases; 3 failed and 1 crashed the runner against e257290 dist (breaker counted SDK-internal retries, hang and SDK-timeout cases timed out at 60 s).
 - Implemented per-leg client options, `redactErr`, SDK connection-error classification and console.log fallback in `llm.ts`; same in `brick_llm.py` plus CF Access headers and User-Agent.
 - Gates: `npm test` 13/13, `python3 test_brick_llm.py` 27/27, typecheck clean, exports identical.
+- ocp-fallback found undeployed (no DNS). Added fallback-specific timeout envs, network cause code in `llm.call` err, and 3 tests: dead fallback fails in under 5 s (measured ~0.5 s against the real hostname), trips its own breaker, and OCP+fallback down with no Anthropic key throws. Gates: 16/16, 28/28.

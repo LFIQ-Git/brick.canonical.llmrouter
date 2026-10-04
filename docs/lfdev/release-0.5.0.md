@@ -21,6 +21,10 @@ Pin to the squash-merge commit of this release on `main`.
 
 brick.command: bump the three workspace pins, then run `npm install --package-lock-only` at the repo root. Consumers moving from bc44c97 or 2d8b7ac also cross the 0.4.0 switch to compiled `dist/`, so their `transpilePackages` entry for this package can be dropped.
 
+## Known infrastructure gap
+
+ocp-fallback is not deployed: `ocp-fallback.lfiq.app` has no DNS record and no Vercel project. Consumers with `OCP_FALLBACK_*` set skip it in under a second and land on Anthropic. Owner: redeploy it, or unset `OCP_FALLBACK_BASE_URL` / `OCP_FALLBACK_API_KEY` in consumers to route straight to Anthropic.
+
 ## Rollback
 
 Revert the consumer's pin to its previous SHA and reinstall. To loosen the new timeouts without a rollback, set `LLM_OCP_TIMEOUT_MS` / `LLM_OCP_MAX_RETRIES` in the consumer's environment.

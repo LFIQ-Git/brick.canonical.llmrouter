@@ -323,6 +323,17 @@ def _redact_err(e: Any) -> str:
     capped at 300 characters."""
     try:
         s = str(e)
+        # Surface the network cause (e.g. ConnectError / errno) so a dead
+        # leg is obvious in the log; SDK messages say only "Connection error.".
+        cur = getattr(e, "__cause__", None)
+        for _ in range(5):
+            if cur is None:
+                break
+            label = type(cur).__name__
+            if label not in s:
+                s = f"{s} ({label}: {cur})"
+                break
+            cur = getattr(cur, "__cause__", None)
     except Exception:  # noqa: BLE001
         s = "[unprintable error]"
     for name in _SECRET_ENV_NAMES:

@@ -14,8 +14,10 @@ Exported API unchanged. Safe to bump from any 0.3.x or 0.4.0 pin.
 - `brick_llm.py` now sends the User-Agent and Cloudflare Access headers OCP requires, and has the same timeouts, retry classification and redaction.
 
 ### Added
-- `LLM_ANTHROPIC_TIMEOUT_MS` / `LLM_ANTHROPIC_MAX_RETRIES` optional overrides.
-- `npm test`: black-box router tests against a local mock of all three legs, run in CI.
+- `LLM_ANTHROPIC_TIMEOUT_MS` / `LLM_ANTHROPIC_MAX_RETRIES` and `LLM_OCP_FALLBACK_TIMEOUT_MS` / `LLM_OCP_FALLBACK_MAX_RETRIES` optional overrides.
+- `llm.call` `err` names the network cause of a connection failure (for example `ECONNREFUSED`, `ENOTFOUND`).
+- Tests prove an unreachable ocp-fallback fails in under a second, trips its own breaker, and that OCP plus fallback down with no Anthropic key throws rather than hangs.
+- `npm test`: 16 black-box router tests against a local mock of all three legs, run in CI.
 - `CLAUDE.md`, SessionStart hook, lfdev adopt documents.
 
 ## 0.4.0 (2026-09-22)

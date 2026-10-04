@@ -112,7 +112,18 @@ leg. `LLM_PROVIDER=anthropic` forces the direct leg. `LLM_MODEL_FAST` /
 `EXTRACTION_MODEL` overrides the default model. `LLM_APP_NAME` /
 `LLM_USER_AGENT` tag outbound requests. `LLM_OCP_TIMEOUT_MS` (default
 180000) and `LLM_OCP_MAX_RETRIES` (default 1) bound both OCP-shaped legs;
-`LLM_ANTHROPIC_TIMEOUT_MS` / `LLM_ANTHROPIC_MAX_RETRIES` override the
-Anthropic SDK defaults only when set.
+`LLM_OCP_FALLBACK_TIMEOUT_MS` / `LLM_OCP_FALLBACK_MAX_RETRIES` override
+the fallback leg alone; `LLM_ANTHROPIC_TIMEOUT_MS` /
+`LLM_ANTHROPIC_MAX_RETRIES` override the Anthropic SDK defaults only when
+set.
+
+**ocp-fallback status (2026-10-03):** `ocp-fallback.lfiq.app` has no DNS
+record and no Vercel project, so the second leg is currently dead. The
+router tolerates this: an unreachable host fails in under a second
+(tested), its own breaker then skips it for 60 s, and calls land on
+Anthropic when `ANTHROPIC_API_KEY` is set. If both OCP and the fallback are
+down and no Anthropic key is configured, the call throws after logging both
+failures; it does not hang. The `llm.call` `err` names the network cause
+(e.g. `Connection error. (ENOTFOUND)`).
 
 Architecture + rollout tracker: `02-brick.intel/docs/llm-architecture.md`.
