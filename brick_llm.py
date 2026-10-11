@@ -69,8 +69,8 @@ def _model_tiers() -> Dict[str, str]:
     """
     return {
         "fast": os.environ.get("LLM_MODEL_FAST", "claude-haiku-4-5"),
-        "balanced": os.environ.get("LLM_MODEL_BALANCED", "claude-sonnet-4-6"),
-        "deep": os.environ.get("LLM_MODEL_DEEP", "claude-sonnet-4-6"),
+        "balanced": os.environ.get("LLM_MODEL_BALANCED", "claude-sonnet-5-5"),
+        "deep": os.environ.get("LLM_MODEL_DEEP", "claude-sonnet-5-5"),
     }
 
 

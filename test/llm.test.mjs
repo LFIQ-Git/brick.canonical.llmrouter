@@ -354,6 +354,25 @@ test("exported API surface is unchanged", async () => {
   assert.deepEqual(Object.keys(L.MODEL_TIERS).sort(), ["balanced", "deep", "fast"]);
 });
 
+test("tier defaults: fast haiku-4-5, balanced and deep sonnet-5-5", async () => {
+  const saved = {};
+  for (const k of ["LLM_MODEL_FAST", "LLM_MODEL_BALANCED", "LLM_MODEL_DEEP", "EXTRACTION_MODEL"]) {
+    saved[k] = process.env[k];
+    delete process.env[k];
+  }
+  try {
+    const L = await load();
+    assert.deepEqual(L.MODEL_TIERS, {
+      fast: "claude-haiku-4-5",
+      balanced: "claude-sonnet-5-5",
+      deep: "claude-sonnet-5-5",
+    });
+    assert.equal(L.DEFAULT_LLM_MODEL, "claude-sonnet-5-5");
+  } finally {
+    for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v;
+  }
+});
+
 // ── workers-ai backstop ─────────────────────────────────────────────────
 
 /** A fake `env.AI` binding that records calls. */
