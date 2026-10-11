@@ -1,4 +1,4 @@
-export type Provider = "ocp" | "ocp-fallback" | "anthropic";
+export type Provider = "ocp" | "ocp-fallback" | "anthropic" | "workers-ai";
 export type ModelTier = "fast" | "balanced" | "deep";
 /** Tier → model ID. One place to bump models family-wide. Keep IDs inside
  *  the OCP proxy allowlist. */
@@ -41,6 +41,39 @@ export interface ChatResult {
     /** The provider that actually produced this answer (post-failover). */
     provider: Provider;
 }
+/** One provider call's normalized output (text + usage + raw response). */
+export interface ProviderOutput {
+    text: string;
+    usage: ChatUsage;
+    raw: unknown;
+}
+/** What a Workers AI runner receives. The model is chosen by the runner (or
+ *  WORKERS_AI_MODEL), never the Claude model ID the caller asked for. */
+export interface WorkersAiRequest {
+    model: string;
+    system: string;
+    messages: ChatMessage[];
+    maxTokens: number;
+    temperature?: number;
+}
+export type WorkersAiRunner = (req: WorkersAiRequest) => Promise<ProviderOutput>;
+/** Default backstop model: general-purpose, 262k context, on the Workers AI catalog. */
+export declare const DEFAULT_WORKERS_AI_MODEL = "@cf/zai-org/glm-5.2";
+/**
+ * Register the last-resort Workers AI leg. Call once from a Worker entry point
+ * with a function that calls `env.AI.run(...)`; see workersAiRunnerFromBinding().
+ * Pass null to remove it. Has no effect outside a Worker unless a runner is set.
+ */
+export declare function setWorkersAiRunner(runner: WorkersAiRunner | null): void;
+/** Minimal shape of a Workers AI binding (`env.AI`). */
+export interface WorkersAiBinding {
+    run(model: string, input: Record<string, unknown>): Promise<unknown>;
+}
+/**
+ * Build a runner from a Workers AI binding. Handles both response shapes the
+ * catalog returns: `{ response: string }` and OpenAI-style `{ choices: [...] }`.
+ */
+export declare function workersAiRunnerFromBinding(ai: WorkersAiBinding): WorkersAiRunner;
 /**
  * Single round-trip chat. Returns the model's text ("" if none). For token
  * counts or the raw provider response, use `chatDetailed()`.

@@ -49,6 +49,7 @@ const ENV_KEYS = [
   "OCP_FALLBACK_BASE_URL", "OCP_FALLBACK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
   "LLM_PROVIDER", "LLM_OCP_TIMEOUT_MS", "LLM_OCP_MAX_RETRIES", "LLM_ANTHROPIC_TIMEOUT_MS",
   "LLM_ANTHROPIC_MAX_RETRIES", "LLM_OCP_FALLBACK_TIMEOUT_MS", "LLM_OCP_FALLBACK_MAX_RETRIES",
+  "WORKERS_AI_MODEL",
 ];
 
 beforeEach(() => {
@@ -350,4 +351,83 @@ test("exported API surface is unchanged", async () => {
     assert.ok(name in L, `missing export ${name}`);
   }
   assert.deepEqual(Object.keys(L.MODEL_TIERS).sort(), ["balanced", "deep", "fast"]);
+});
+
+// ── workers-ai backstop ─────────────────────────────────────────────────
+
+/** A fake `env.AI` binding that records calls. */
+function fakeAi(reply) {
+  const calls = [];
+  return {
+    calls,
+    run: async (model, input) => {
+      calls.push({ model, input });
+      if (reply instanceof Error) throw reply;
+      return reply;
+    },
+  };
+}
+
+test("Anthropic out of credit falls back to the Workers AI binding", async () => {
+  process.env.ANTHROPIC_BASE_URL = `${base}/anth`;
+  process.env.ANTHROPIC_API_KEY = "test-anth-key-0123456789";
+  process.env.LLM_ANTHROPIC_MAX_RETRIES = "0";
+  handlers.anth = fail(400, "Your credit balance is too low to access the Anthropic API.");
+  const L = await load();
+  const ai = fakeAi({ response: '{"ok":true}', usage: { prompt_tokens: 9, completion_tokens: 3 } });
+  L.setWorkersAiRunner(L.workersAiRunnerFromBinding(ai));
+  const { result, lines } = await captureLogs(() => L.chatDetailed(ARGS));
+  assert.equal(result.text, '{"ok":true}');
+  assert.equal(result.provider, "workers-ai");
+  assert.equal(result.usage.input_tokens, 9);
+  assert.equal(ai.calls.length, 1);
+  assert.equal(ai.calls[0].model, L.DEFAULT_WORKERS_AI_MODEL);
+  assert.deepEqual(ai.calls[0].input.messages[0], { role: "system", content: "sys" });
+  assert.deepEqual(lines.map((l) => [l.provider, l.ok]), [["anthropic", false], ["workers-ai", true]]);
+});
+
+test("Workers AI is used when no paid provider is configured", async () => {
+  process.env.WORKERS_AI_MODEL = "@cf/test/model";
+  const L = await load();
+  const ai = fakeAi({ choices: [{ message: { content: "from-choices" } }] });
+  L.setWorkersAiRunner(L.workersAiRunnerFromBinding(ai));
+  const result = await L.chatDetailed(ARGS);
+  assert.equal(result.text, "from-choices");
+  assert.equal(result.provider, "workers-ai");
+  assert.equal(ai.calls[0].model, "@cf/test/model");
+  assert.equal(hits.anth, 0);
+});
+
+test("healthy Anthropic never touches Workers AI", async () => {
+  process.env.ANTHROPIC_BASE_URL = `${base}/anth`;
+  process.env.ANTHROPIC_API_KEY = "test-anth-key-0123456789";
+  handlers.anth = anthOk("from-anth");
+  const L = await load();
+  const ai = fakeAi({ response: "unused" });
+  L.setWorkersAiRunner(L.workersAiRunnerFromBinding(ai));
+  const result = await L.chatDetailed(ARGS);
+  assert.equal(result.provider, "anthropic");
+  assert.equal(ai.calls.length, 0);
+});
+
+test("when Workers AI also fails, the Anthropic error is what surfaces", async () => {
+  process.env.ANTHROPIC_BASE_URL = `${base}/anth`;
+  process.env.ANTHROPIC_API_KEY = "test-anth-key-0123456789";
+  process.env.LLM_ANTHROPIC_MAX_RETRIES = "0";
+  handlers.anth = fail(401, "invalid x-api-key");
+  const L = await load();
+  L.setWorkersAiRunner(L.workersAiRunnerFromBinding(fakeAi(new Error("neurons exhausted"))));
+  const { error, lines } = await captureLogs(() => L.chatDetailed(ARGS));
+  assert.match(String(error?.message), /invalid x-api-key/);
+  assert.deepEqual(lines.map((l) => [l.provider, l.ok]), [["anthropic", false], ["workers-ai", false]]);
+});
+
+test("without a registered runner, behavior is unchanged", async () => {
+  process.env.ANTHROPIC_BASE_URL = `${base}/anth`;
+  process.env.ANTHROPIC_API_KEY = "test-anth-key-0123456789";
+  process.env.LLM_ANTHROPIC_MAX_RETRIES = "0";
+  handlers.anth = fail(400, "credit balance is too low");
+  const L = await load();
+  const { error } = await captureLogs(() => L.chatDetailed(ARGS));
+  assert.match(String(error?.message), /credit balance/);
 });

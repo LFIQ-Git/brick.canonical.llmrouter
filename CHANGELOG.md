@@ -2,6 +2,14 @@
 
 All notable changes to `@lfiq/canonical-llm`. Consumers pin by commit SHA; bump the pin to pick up a release.
 
+## 0.6.0 (2026-10-11)
+
+Additive. Safe to bump from 0.5.0; nothing changes until an app registers a runner.
+
+### Added
+- Workers AI backstop leg. A Worker calls `setWorkersAiRunner(workersAiRunnerFromBinding(env.AI))` once, and any call that fails on every other leg (Anthropic out of credit, revoked key, outage, no paid provider configured) is answered by Cloudflare Workers AI through that Worker's own `AI` binding. No key and no dependency on another app. Model: `WORKERS_AI_MODEL`, default `@cf/zai-org/glm-5.2`. `provider` reports `"workers-ai"` and the `llm.call` line logs the leg.
+- If the backstop also fails, the paid leg's error is rethrown, since that is the one to act on.
+
 ## 0.5.0 (2026-10-03)
 
 Exported API unchanged. Safe to bump from any 0.3.x or 0.4.0 pin.

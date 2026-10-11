@@ -14,8 +14,14 @@
  *                      path when OCP_FALLBACK_BASE_URL + OCP_FALLBACK_API_KEY
  *                      are set. Kills the Win-PC single-point-of-failure.
  *   - "anthropic"    — Anthropic SDK directly with ANTHROPIC_API_KEY. Last
- *                      resort on the OCP chain, and the only leg when
+ *                      paid leg on the OCP chain, and the primary when
  *                      LLM_PROVIDER=anthropic.
+ *   - "workers-ai"   — Cloudflare Workers AI through the calling Worker's own
+ *                      `AI` binding, registered with setWorkersAiRunner(). No
+ *                      key, no proxy, no dependency on any other app. Runs only
+ *                      after every other leg has failed (or none is configured),
+ *                      so an exhausted Anthropic balance, a revoked key or an
+ *                      outage degrades extraction instead of stopping it.
  *
  * Four things every app gets for free here:
  *   1. Automatic failover — if OCP errors transiently, the call retries on
@@ -269,6 +275,52 @@ function resolveModel(args) {
         return { model: MODEL_TIERS[args.tier], tier: args.tier };
     return { model: DEFAULT_LLM_MODEL };
 }
+/** Default backstop model: general-purpose, 262k context, on the Workers AI catalog. */
+export const DEFAULT_WORKERS_AI_MODEL = "@cf/zai-org/glm-5.2";
+let _workersAiRunner = null;
+/**
+ * Register the last-resort Workers AI leg. Call once from a Worker entry point
+ * with a function that calls `env.AI.run(...)`; see workersAiRunnerFromBinding().
+ * Pass null to remove it. Has no effect outside a Worker unless a runner is set.
+ */
+export function setWorkersAiRunner(runner) {
+    _workersAiRunner = runner;
+}
+/**
+ * Build a runner from a Workers AI binding. Handles both response shapes the
+ * catalog returns: `{ response: string }` and OpenAI-style `{ choices: [...] }`.
+ */
+export function workersAiRunnerFromBinding(ai) {
+    return async ({ model, system, messages, maxTokens, temperature }) => {
+        const raw = (await ai.run(model, {
+            messages: [{ role: "system", content: system }, ...messages],
+            max_tokens: maxTokens,
+            ...(temperature !== undefined ? { temperature } : {}),
+        }));
+        const fromChoices = raw?.choices?.[0]?.message?.content;
+        const text = typeof raw?.response === "string"
+            ? raw.response
+            : typeof fromChoices === "string"
+                ? fromChoices
+                : raw?.response !== undefined
+                    ? JSON.stringify(raw.response)
+                    : "";
+        return {
+            text,
+            usage: { input_tokens: raw?.usage?.prompt_tokens, output_tokens: raw?.usage?.completion_tokens },
+            raw,
+        };
+    };
+}
+async function callWorkersAi(system, messages, maxTokens, temperature) {
+    if (!_workersAiRunner)
+        throw new Error("workers-ai runner not registered");
+    const model = process.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL;
+    const out = await _workersAiRunner({ model, system, messages, maxTokens, temperature });
+    if (!out.text)
+        throw new Error(`workers-ai returned no text (${model})`);
+    return { out, model };
+}
 async function callOpenAIShape(client, system, messages, model, maxTokens, temperature) {
     const r = await client.chat.completions.create({
         model,
@@ -345,7 +397,7 @@ async function runChat(args) {
             _ocpBreaker.note(false);
             const err = redactErr(e);
             logCall({ provider: "ocp", model, tier, latencyMs: Date.now() - t, ok: false, err });
-            if (!fallbackAvailable && !anthropicAvailable)
+            if (!fallbackAvailable && !anthropicAvailable && !_workersAiRunner)
                 throw e;
             // fall through
         }
@@ -363,32 +415,60 @@ async function runChat(args) {
             _ocpFallbackBreaker.note(false);
             const err = redactErr(e);
             logCall({ provider: "ocp-fallback", model, tier, latencyMs: Date.now() - t, ok: false, failedOver: true, err });
-            if (!anthropicAvailable)
+            if (!anthropicAvailable && !_workersAiRunner)
                 throw e;
             // fall through
         }
     }
     // ── Leg 3: Anthropic direct SDK ────────────────────────────────────────
     const fellOver = primary === "ocp";
-    const t = Date.now();
+    let lastErr = new Error("No LLM provider configured: set ANTHROPIC_API_KEY or OCP_BASE_URL.");
+    if (anthropicAvailable) {
+        const t = Date.now();
+        try {
+            const out = await callAnthropic(args.system, args.messages, model, maxTokens, args.temperature);
+            logCall({
+                provider: "anthropic",
+                model,
+                tier,
+                latencyMs: Date.now() - t,
+                ok: true,
+                failedOver: fellOver,
+                cacheWrite: out.usage.cache_creation_input_tokens,
+                cacheRead: out.usage.cache_read_input_tokens,
+            });
+            return { ...out, provider: "anthropic" };
+        }
+        catch (e) {
+            const err = redactErr(e);
+            logCall({ provider: "anthropic", model, tier, latencyMs: Date.now() - t, ok: false, failedOver: fellOver, err });
+            if (!_workersAiRunner)
+                throw e;
+            lastErr = e;
+        }
+    }
+    // ── Leg 4: Workers AI backstop (calling Worker's own AI binding) ───────
+    if (!_workersAiRunner)
+        throw lastErr;
+    const t4 = Date.now();
     try {
-        const out = await callAnthropic(args.system, args.messages, model, maxTokens, args.temperature);
-        logCall({
-            provider: "anthropic",
-            model,
-            tier,
-            latencyMs: Date.now() - t,
-            ok: true,
-            failedOver: fellOver,
-            cacheWrite: out.usage.cache_creation_input_tokens,
-            cacheRead: out.usage.cache_read_input_tokens,
-        });
-        return { ...out, provider: "anthropic" };
+        const { out, model: wModel } = await callWorkersAi(args.system, args.messages, maxTokens, args.temperature);
+        logCall({ provider: "workers-ai", model: wModel, tier, latencyMs: Date.now() - t4, ok: true, failedOver: true });
+        return { ...out, provider: "workers-ai" };
     }
     catch (e) {
         const err = redactErr(e);
-        logCall({ provider: "anthropic", model, tier, latencyMs: Date.now() - t, ok: false, failedOver: fellOver, err });
-        throw e;
+        logCall({
+            provider: "workers-ai",
+            model: process.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL,
+            tier,
+            latencyMs: Date.now() - t4,
+            ok: false,
+            failedOver: true,
+            err,
+        });
+        // Surface the paid-leg error: it is the one an operator needs to act on.
+        throw lastErr;
     }
 }
 /**
