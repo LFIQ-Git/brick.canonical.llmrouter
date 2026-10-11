@@ -2,6 +2,17 @@
 
 All notable changes to `@lfiq/canonical-llm`. Consumers pin by commit SHA; bump the pin to pick up a release.
 
+## 0.7.0 (2026-10-11)
+
+Exported API unchanged. Model defaults change; provider order does not.
+
+### Changed
+- `balanced` and `deep` tiers now default to `claude-sonnet-5-5` (was `claude-sonnet-4-6`). `DEFAULT_LLM_MODEL` follows `balanced`, so untiered calls move too. `fast` stays `claude-haiku-4-5`, because OCP does not serve a 5.5 Haiku. Same change in `brick_llm.py`.
+- `LLM_MODEL_FAST`, `LLM_MODEL_BALANCED`, `LLM_MODEL_DEEP` and `EXTRACTION_MODEL` still override per deployment.
+
+### Consumers to bump
+brick.intel, brick.command (apps/web, apps/collect, apps/leasing), lfiq.registry, brick.keystone, and brick.sticks and lfiq.pursue once they adopt the router.
+
 ## 0.6.0 (2026-10-11)
 
 Additive. Safe to bump from 0.5.0; nothing changes until an app registers a runner.

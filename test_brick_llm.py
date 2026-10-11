@@ -78,9 +78,9 @@ def test_default_model_ids() -> None:
     ):
         tiers = L._model_tiers()
         assert tiers["fast"] == "claude-haiku-4-5"
-        assert tiers["balanced"] == "claude-sonnet-4-6"
-        assert tiers["deep"] == "claude-sonnet-4-6"
-        assert L.default_llm_model() == "claude-sonnet-4-6"
+        assert tiers["balanced"] == "claude-sonnet-5-5"
+        assert tiers["deep"] == "claude-sonnet-5-5"
+        assert L.default_llm_model() == "claude-sonnet-5-5"
 
 
 def test_tier_env_overrides() -> None:

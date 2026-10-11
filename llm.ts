@@ -48,8 +48,8 @@ export type ModelTier = "fast" | "balanced" | "deep";
  *  the OCP proxy allowlist. */
 export const MODEL_TIERS: Record<ModelTier, string> = {
   fast: process.env.LLM_MODEL_FAST ?? "claude-haiku-4-5",
-  balanced: process.env.LLM_MODEL_BALANCED ?? "claude-sonnet-4-6",
-  deep: process.env.LLM_MODEL_DEEP ?? "claude-sonnet-4-6",
+  balanced: process.env.LLM_MODEL_BALANCED ?? "claude-sonnet-5-5",
+  deep: process.env.LLM_MODEL_DEEP ?? "claude-sonnet-5-5",
 };
 
 /** Default model when neither `model` nor `tier` is given. */

@@ -108,8 +108,9 @@ source of truth**; re-sync the mirror after each release.
 service token sent to the OCP gateway. `OCP_FALLBACK_BASE_URL`,
 `OCP_FALLBACK_API_KEY` — hosted fallback leg. `ANTHROPIC_API_KEY` — direct
 leg. `LLM_PROVIDER=anthropic` forces the direct leg. `LLM_MODEL_FAST` /
-`LLM_MODEL_BALANCED` / `LLM_MODEL_DEEP` override tier model IDs;
-`EXTRACTION_MODEL` overrides the default model. `LLM_APP_NAME` /
+`LLM_MODEL_BALANCED` / `LLM_MODEL_DEEP` override tier model IDs (defaults
+`claude-haiku-4-5` / `claude-sonnet-5-5` / `claude-sonnet-5-5`);
+`EXTRACTION_MODEL` overrides the default model (default: the balanced tier). `LLM_APP_NAME` /
 `LLM_USER_AGENT` tag outbound requests. `LLM_OCP_TIMEOUT_MS` (default
 180000) and `LLM_OCP_MAX_RETRIES` (default 1) bound both OCP-shaped legs;
 `LLM_OCP_FALLBACK_TIMEOUT_MS` / `LLM_OCP_FALLBACK_MAX_RETRIES` override
