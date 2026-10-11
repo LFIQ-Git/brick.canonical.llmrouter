@@ -60,9 +60,9 @@ export type WorkersAiRunner = (req: WorkersAiRequest) => Promise<ProviderOutput>
 /** Default backstop model: general-purpose, 262k context, on the Workers AI catalog. */
 export declare const DEFAULT_WORKERS_AI_MODEL = "@cf/zai-org/glm-5.2";
 /**
- * Register the last-resort Workers AI leg. Call once from a Worker entry point
- * with a function that calls `env.AI.run(...)`; see workersAiRunnerFromBinding().
- * Pass null to remove it. Has no effect outside a Worker unless a runner is set.
+ * Register the last-resort Workers AI leg. Call once per isolate from a Worker
+ * entry point; see workersAiRunnerFromBinding(). Pass null to remove it.
+ * Outside a Worker nothing is registered and the chain is unchanged.
  */
 export declare function setWorkersAiRunner(runner: WorkersAiRunner | null): void;
 /** Minimal shape of a Workers AI binding (`env.AI`). */

@@ -53,6 +53,7 @@ const ENV_KEYS = [
 ];
 
 beforeEach(() => {
+  delete globalThis.__lfiqWorkersAiRunner;
   for (const k of ENV_KEYS) delete process.env[k];
   for (const k of Object.keys(handlers)) delete handlers[k];
   for (const k of Object.keys(hits)) hits[k] = 0;

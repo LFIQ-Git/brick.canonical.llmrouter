@@ -277,14 +277,21 @@ function resolveModel(args) {
 }
 /** Default backstop model: general-purpose, 262k context, on the Workers AI catalog. */
 export const DEFAULT_WORKERS_AI_MODEL = "@cf/zai-org/glm-5.2";
-let _workersAiRunner = null;
+// Kept on globalThis, not in a module variable: bundlers such as vinext can load
+// this module once per environment (rsc, ssr), and a runner registered from the
+// Worker entry must be visible to every copy.
+const RUNNER_KEY = "__lfiqWorkersAiRunner";
+const _g = globalThis;
+function workersAiRunner() {
+    return _g[RUNNER_KEY] ?? null;
+}
 /**
- * Register the last-resort Workers AI leg. Call once from a Worker entry point
- * with a function that calls `env.AI.run(...)`; see workersAiRunnerFromBinding().
- * Pass null to remove it. Has no effect outside a Worker unless a runner is set.
+ * Register the last-resort Workers AI leg. Call once per isolate from a Worker
+ * entry point; see workersAiRunnerFromBinding(). Pass null to remove it.
+ * Outside a Worker nothing is registered and the chain is unchanged.
  */
 export function setWorkersAiRunner(runner) {
-    _workersAiRunner = runner;
+    _g[RUNNER_KEY] = runner;
 }
 /**
  * Build a runner from a Workers AI binding. Handles both response shapes the
@@ -313,10 +320,11 @@ export function workersAiRunnerFromBinding(ai) {
     };
 }
 async function callWorkersAi(system, messages, maxTokens, temperature) {
-    if (!_workersAiRunner)
+    const runner = workersAiRunner();
+    if (!runner)
         throw new Error("workers-ai runner not registered");
     const model = process.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL;
-    const out = await _workersAiRunner({ model, system, messages, maxTokens, temperature });
+    const out = await runner({ model, system, messages, maxTokens, temperature });
     if (!out.text)
         throw new Error(`workers-ai returned no text (${model})`);
     return { out, model };
@@ -397,7 +405,7 @@ async function runChat(args) {
             _ocpBreaker.note(false);
             const err = redactErr(e);
             logCall({ provider: "ocp", model, tier, latencyMs: Date.now() - t, ok: false, err });
-            if (!fallbackAvailable && !anthropicAvailable && !_workersAiRunner)
+            if (!fallbackAvailable && !anthropicAvailable && !workersAiRunner())
                 throw e;
             // fall through
         }
@@ -415,7 +423,7 @@ async function runChat(args) {
             _ocpFallbackBreaker.note(false);
             const err = redactErr(e);
             logCall({ provider: "ocp-fallback", model, tier, latencyMs: Date.now() - t, ok: false, failedOver: true, err });
-            if (!anthropicAvailable && !_workersAiRunner)
+            if (!anthropicAvailable && !workersAiRunner())
                 throw e;
             // fall through
         }
@@ -442,13 +450,13 @@ async function runChat(args) {
         catch (e) {
             const err = redactErr(e);
             logCall({ provider: "anthropic", model, tier, latencyMs: Date.now() - t, ok: false, failedOver: fellOver, err });
-            if (!_workersAiRunner)
+            if (!workersAiRunner())
                 throw e;
             lastErr = e;
         }
     }
     // ── Leg 4: Workers AI backstop (calling Worker's own AI binding) ───────
-    if (!_workersAiRunner)
+    if (!workersAiRunner())
         throw lastErr;
     const t4 = Date.now();
     try {
