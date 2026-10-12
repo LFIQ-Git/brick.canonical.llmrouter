@@ -35,6 +35,11 @@
  *      returns `{ text, usage, raw, provider }` for callers that need token
  *      counts, the raw provider response, or the provider that actually
  *      answered (post-failover).
+ *   5. Tools and streaming (0.8.0): `chatStream()` yields text deltas and
+ *      tool-call events; `chatTools()` returns the whole turn with normalized
+ *      tool calls. OpenAI-style function tools in, same provider chain and
+ *      breakers. The caller runs the tools and sends results back as `tool`
+ *      messages.
  *
  * No app may import `openai` / `@anthropic-ai/sdk` outside this file.
  */
@@ -544,5 +549,378 @@ export function withTimeout(p, ms, label) {
         }, ms);
         p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
     });
+}
+/** Convert Anthropic-format tools (`{ name, description, input_schema }`) to
+ *  OpenAI function tools, for callers migrating from the Anthropic SDK. */
+export function toolsFromAnthropic(tools) {
+    return tools.map((t) => ({
+        type: "function",
+        function: {
+            name: t.name,
+            ...(t.description ? { description: t.description } : {}),
+            parameters: t.input_schema ?? { type: "object", properties: {} },
+        },
+    }));
+}
+function systemText(system) {
+    return typeof system === "string" ? system : system.map((p) => p.text).join("");
+}
+function parseArgs(raw) {
+    if (!raw)
+        return {};
+    try {
+        const v = JSON.parse(raw);
+        return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+    }
+    catch {
+        return {};
+    }
+}
+function isAbort(e, signal) {
+    if (signal?.aborted)
+        return true;
+    const name = e?.name;
+    return name === "AbortError" || e instanceof OpenAI.APIUserAbortError || e instanceof Anthropic.APIUserAbortError;
+}
+function toOpenAIMessages(system, messages) {
+    const out = [{ role: "system", content: systemText(system) }];
+    for (const m of messages) {
+        if (m.role === "user")
+            out.push({ role: "user", content: m.content });
+        else if (m.role === "assistant") {
+            if (m.toolCalls?.length) {
+                out.push({
+                    role: "assistant",
+                    content: m.content || null,
+                    tool_calls: m.toolCalls.map((c) => ({
+                        id: c.id,
+                        type: "function",
+                        function: { name: c.name, arguments: JSON.stringify(c.arguments ?? {}) },
+                    })),
+                });
+            }
+            else
+                out.push({ role: "assistant", content: m.content });
+        }
+        else
+            out.push({ role: "tool", tool_call_id: m.toolCallId, content: m.content });
+    }
+    return out;
+}
+function mapOpenAIFinish(r) {
+    if (r === "stop")
+        return "stop";
+    if (r === "tool_calls" || r === "function_call")
+        return "tool_calls";
+    if (r === "length")
+        return "length";
+    return "other";
+}
+async function* openAIShapeLeg(client, args, model) {
+    const tools = args.tools?.length ? args.tools : undefined;
+    const body = {
+        model,
+        max_tokens: args.maxTokens ?? 8192,
+        stream: true,
+        stream_options: { include_usage: true },
+        messages: toOpenAIMessages(args.system, args.messages),
+        ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
+        ...(tools ? { tools, ...(args.toolChoice ? { tool_choice: args.toolChoice } : {}) } : {}),
+        ...(args.effort ? { reasoning_effort: args.effort } : {}),
+    };
+    const stream = await client.chat.completions.create(body, { signal: args.signal });
+    let text = "";
+    let finish;
+    let usage = {};
+    const calls = [];
+    const chunks = [];
+    for await (const chunk of stream) {
+        chunks.push(chunk);
+        if (chunk.usage) {
+            usage = { input_tokens: chunk.usage.prompt_tokens, output_tokens: chunk.usage.completion_tokens };
+        }
+        const choice = chunk.choices?.[0];
+        if (!choice)
+            continue;
+        const delta = choice.delta;
+        if (delta?.content) {
+            text += delta.content;
+            yield { type: "text", text: delta.content };
+        }
+        for (const tc of delta?.tool_calls ?? []) {
+            const i = tc.index ?? calls.length;
+            const slot = (calls[i] ??= { id: "", name: "", args: "", started: false });
+            if (tc.id)
+                slot.id = tc.id;
+            if (tc.function?.name)
+                slot.name += tc.function.name;
+            if (tc.function?.arguments)
+                slot.args += tc.function.arguments;
+            if (!slot.started && slot.name) {
+                slot.started = true;
+                yield { type: "tool_call_start", index: i, id: slot.id, name: slot.name };
+            }
+        }
+        if (choice.finish_reason)
+            finish = choice.finish_reason;
+    }
+    const toolCalls = calls
+        .filter((c) => c && c.name)
+        .map((c, i) => ({ id: c.id || `call_${i}`, name: c.name, arguments: parseArgs(c.args) }));
+    for (const call of toolCalls)
+        yield { type: "tool_call", call };
+    let finishReason = mapOpenAIFinish(finish);
+    if (toolCalls.length && finishReason !== "length")
+        finishReason = "tool_calls";
+    yield { type: "end", out: { text, usage, raw: chunks, toolCalls, finishReason } };
+}
+const EPHEMERAL = { type: "ephemeral" };
+/** Translate the normalized conversation to Anthropic messages. Tool results
+ *  become `tool_result` blocks on a user turn; consecutive same-role turns are
+ *  merged, since Anthropic requires alternation. The last block gets a cache
+ *  breakpoint so each tool-loop round trip reads the previous one from cache. */
+function toAnthropicMessages(messages) {
+    const out = [];
+    const push = (role, blocks) => {
+        if (!blocks.length)
+            return;
+        const last = out[out.length - 1];
+        if (last && last.role === role)
+            last.content.push(...blocks);
+        else
+            out.push({ role, content: blocks });
+    };
+    for (const m of messages) {
+        if (m.role === "user")
+            push("user", m.content ? [{ type: "text", text: m.content }] : []);
+        else if (m.role === "assistant") {
+            const blocks = [];
+            if (m.content)
+                blocks.push({ type: "text", text: m.content });
+            for (const c of m.toolCalls ?? [])
+                blocks.push({ type: "tool_use", id: c.id, name: c.name, input: c.arguments ?? {} });
+            push("assistant", blocks);
+        }
+        else {
+            push("user", [{
+                    type: "tool_result",
+                    tool_use_id: m.toolCallId,
+                    content: m.content,
+                    ...(m.isError ? { is_error: true } : {}),
+                }]);
+        }
+    }
+    const last = out[out.length - 1];
+    if (last) {
+        const i = last.content.length - 1;
+        const b = last.content[i];
+        if (!(b.type === "text" && !b.text))
+            last.content[i] = { ...b, cache_control: EPHEMERAL };
+    }
+    return out;
+}
+function mapAnthropicStop(r) {
+    if (r === "end_turn" || r === "stop_sequence")
+        return "stop";
+    if (r === "tool_use")
+        return "tool_calls";
+    if (r === "max_tokens")
+        return "length";
+    return "other";
+}
+async function* anthropicLeg(args, model) {
+    const a = getAnthropic();
+    const system = typeof args.system === "string"
+        ? [{ type: "text", text: args.system, cache_control: EPHEMERAL }]
+        : args.system.filter((p) => p.text).map((p) => ({ type: "text", text: p.text, ...(p.cache_control ? { cache_control: p.cache_control } : {}) }));
+    const tools = (args.tools ?? []).map((t, i, all) => ({
+        name: t.function.name,
+        ...(t.function.description ? { description: t.function.description } : {}),
+        input_schema: t.function.parameters ?? { type: "object", properties: {} },
+        ...(i === all.length - 1 ? { cache_control: EPHEMERAL } : {}),
+    }));
+    const body = {
+        model,
+        max_tokens: args.maxTokens ?? 8192,
+        system,
+        messages: toAnthropicMessages(args.messages),
+        ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
+        ...(tools.length ? { tools, ...(args.toolChoice === "none" ? { tool_choice: { type: "none" } } : {}) } : {}),
+        ...(args.effort ? { output_config: { effort: args.effort } } : {}),
+        ...(args.anthropic ?? {}),
+    };
+    const stream = a.messages.stream(body, { signal: args.signal });
+    let index = 0;
+    for await (const ev of stream) {
+        if (ev.type === "content_block_start" && ev.content_block.type === "tool_use") {
+            yield { type: "tool_call_start", index: index++, id: ev.content_block.id, name: ev.content_block.name };
+        }
+        else if (ev.type === "content_block_delta" && ev.delta.type === "text_delta" && ev.delta.text) {
+            yield { type: "text", text: ev.delta.text };
+        }
+    }
+    const final = await stream.finalMessage();
+    const toolCalls = [];
+    let text = "";
+    for (const b of final.content) {
+        if (b.type === "text")
+            text += b.text;
+        else if (b.type === "tool_use") {
+            const input = b.input;
+            toolCalls.push({
+                id: b.id,
+                name: b.name,
+                arguments: input && typeof input === "object" && !Array.isArray(input) ? input : {},
+            });
+        }
+    }
+    for (const call of toolCalls)
+        yield { type: "tool_call", call };
+    yield {
+        type: "end",
+        out: {
+            text,
+            usage: {
+                input_tokens: final.usage?.input_tokens,
+                output_tokens: final.usage?.output_tokens,
+                cache_creation_input_tokens: final.usage?.cache_creation_input_tokens ?? undefined,
+                cache_read_input_tokens: final.usage?.cache_read_input_tokens ?? undefined,
+            },
+            raw: final,
+            toolCalls,
+            finishReason: mapAnthropicStop(final.stop_reason),
+        },
+    };
+}
+async function* workersAiLeg(args) {
+    const msgs = [];
+    for (const m of args.messages) {
+        if (m.role === "user" || m.role === "assistant")
+            msgs.push({ role: m.role, content: m.content });
+    }
+    const { out } = await callWorkersAi(systemText(args.system), msgs, args.maxTokens ?? 8192, args.temperature);
+    yield { type: "text", text: out.text };
+    yield { type: "end", out: { text: out.text, usage: out.usage, raw: out.raw, toolCalls: [], finishReason: "stop" } };
+}
+function streamLegs(args, model) {
+    const primary = getProvider();
+    const legs = [];
+    if (primary === "ocp") {
+        if (!_ocpBreaker.open()) {
+            legs.push({ provider: "ocp", model, failedOver: false, breaker: _ocpBreaker, run: () => openAIShapeLeg(getOpenAI(), args, model) });
+        }
+        if (ocpFallbackConfigured() && !_ocpFallbackBreaker.open()) {
+            legs.push({ provider: "ocp-fallback", model, failedOver: true, breaker: _ocpFallbackBreaker, run: () => openAIShapeLeg(getOpenAIFallback(), args, model) });
+        }
+    }
+    if (process.env.ANTHROPIC_API_KEY) {
+        legs.push({ provider: "anthropic", model, failedOver: primary === "ocp", run: () => anthropicLeg(args, model) });
+    }
+    if (workersAiRunner() && !args.tools?.length) {
+        legs.push({
+            provider: "workers-ai",
+            model: process.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL,
+            failedOver: true,
+            run: () => workersAiLeg(args),
+        });
+    }
+    return legs;
+}
+/**
+ * Core of chatStream / chatTools. `buffered` collects a whole leg before
+ * yielding anything, so a failure at any point can move to the next leg.
+ * Unbuffered, failover is possible only until the first event is yielded.
+ */
+async function* runStream(args, buffered) {
+    const { model, tier } = resolveModel({ system: "", messages: [], model: args.model, tier: args.tier });
+    const legs = streamLegs(args, model);
+    const mode = buffered ? "tools" : "stream";
+    let lastErr = new Error("No LLM provider configured: set ANTHROPIC_API_KEY or OCP_BASE_URL.");
+    // Surface the most actionable error: the last paid leg's, not the backstop's.
+    let paidErr;
+    for (const leg of legs) {
+        if (args.signal?.aborted)
+            throw args.signal.reason ?? new Error("aborted");
+        const t = Date.now();
+        let emitted = false;
+        const log = (ok, extra = {}) => logCall({
+            provider: leg.provider,
+            model: leg.model,
+            tier,
+            latencyMs: Date.now() - t,
+            ok,
+            ...(leg.failedOver ? { failedOver: true } : {}),
+            mode,
+            ...(extra.out ? { toolCalls: extra.out.toolCalls.length } : {}),
+            ...(extra.out?.usage.cache_creation_input_tokens !== undefined ? { cacheWrite: extra.out.usage.cache_creation_input_tokens } : {}),
+            ...(extra.out?.usage.cache_read_input_tokens !== undefined ? { cacheRead: extra.out.usage.cache_read_input_tokens } : {}),
+            ...(extra.err ? { err: extra.err } : {}),
+        });
+        try {
+            const pending = [];
+            let result = null;
+            for await (const ev of leg.run()) {
+                let out;
+                if (ev.type === "end") {
+                    result = { ...ev.out, provider: leg.provider, model: leg.model };
+                    out = { type: "done", result };
+                }
+                else
+                    out = ev;
+                if (buffered)
+                    pending.push(out);
+                else {
+                    if (!emitted) {
+                        emitted = true;
+                        yield { type: "start", provider: leg.provider, model: leg.model };
+                    }
+                    yield out;
+                }
+            }
+            if (!result)
+                throw new Error(`${leg.provider} stream ended without a result`);
+            leg.breaker?.note(true);
+            log(true, { out: result });
+            if (buffered) {
+                yield { type: "start", provider: leg.provider, model: leg.model };
+                for (const ev of pending)
+                    yield ev;
+            }
+            return;
+        }
+        catch (e) {
+            if (isAbort(e, args.signal))
+                throw e;
+            leg.breaker?.note(false);
+            log(false, { err: redactErr(e) });
+            if (emitted)
+                throw e; // text already reached the caller; no silent restart
+            lastErr = e;
+            if (leg.provider !== "workers-ai")
+                paidErr = e;
+        }
+    }
+    throw paidErr ?? lastErr;
+}
+/**
+ * Stream one model turn with optional function tools. Yields `start`
+ * (provider + model), `text` deltas, `tool_call_start`, `tool_call` and a
+ * final `done` carrying the full `ToolChatResult`. Fails over to the next leg
+ * only before the first event; after that an error is thrown.
+ */
+export function chatStream(args) {
+    return runStream(args, false);
+}
+/**
+ * One model turn with optional function tools, not streamed to the caller.
+ * Returns the text, normalized tool calls and finish reason. Fails over to the
+ * next leg on any error, mid-response included.
+ */
+export async function chatTools(args) {
+    for await (const ev of runStream(args, true)) {
+        if (ev.type === "done")
+            return ev.result;
+    }
+    throw new Error("chatTools: no result");
 }
 //# sourceMappingURL=llm.js.map

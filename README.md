@@ -29,6 +29,22 @@ together** → push → bump the SHA pin in each consumer. CI runs
 - `chatDetailed()` / `chatDetailedWithRetry()` — same call, richer return
   (`{ text, usage, raw, provider }`) for callers that need token counts, the
   raw provider response, or the provider that actually answered after failover.
+- `chatStream()` / `chatTools()` (since 0.8.0) — one model turn with
+  OpenAI-format function tools. `chatStream()` is an async iterator of
+  `start` (provider + model), `text` deltas, `tool_call_start`, `tool_call`
+  and a final `done`; `chatTools()` returns the whole turn
+  (`{ text, toolCalls, finishReason, usage, provider, model }`). The caller
+  runs the tools and appends `{ role: "tool", toolCallId, content }`
+  messages. Same chain and breakers: OCP and ocp-fallback get the request in
+  OpenAI shape; the Anthropic leg gets tools, tool calls and tool results
+  translated to Anthropic blocks, with cache breakpoints on the system parts,
+  the last tool and the last message; Workers AI answers only text-only
+  turns. `chatStream()` fails over only before its first event; `chatTools()`
+  buffers and can fail over mid-response. `effort` maps to
+  `reasoning_effort` (OCP) and `output_config.effort` (Anthropic);
+  `anthropic: {...}` adds fields to the Anthropic leg only. `signal` aborts
+  without failover. `toolsFromAnthropic()` converts `input_schema` tools.
+  TypeScript only; `brick_llm.py` has no tools API.
 - Provider chain with per-leg circuit breakers and automatic failover:
   **OCP (Win-PC, subscription, $0/call) → ocp-fallback (hosted, paid) →
   Anthropic direct SDK**. Forcing `LLM_PROVIDER=anthropic` runs leg 3 only.
@@ -88,7 +104,7 @@ network, no SDKs needed.
 
 ## Tests
 
-`npm test` runs `test/llm.test.mjs` against the compiled `dist/llm.js` with
+`npm test` runs `test/llm.test.mjs` and `test/tools.test.mjs` against the compiled `dist/llm.js` with
 a local mock server standing in for OCP, ocp-fallback and Anthropic: the
 failover order, breaker, timeouts, retry classification, log redaction and
 the exported API. Build first (`npm run build`). CI runs it on every PR. When `llm.ts` changes, change `brick_llm.py` with
