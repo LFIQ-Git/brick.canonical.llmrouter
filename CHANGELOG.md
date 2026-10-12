@@ -2,6 +2,27 @@
 
 All notable changes to `@lfiq/canonical-llm`. Consumers pin by commit SHA; bump the pin to pick up a release.
 
+## 0.8.0 (2026-10-12)
+
+Additive. Existing exports and the text API are unchanged; safe to bump from 0.7.0.
+
+### Added
+- `chatStream(args)`: one model turn as an async iterator of `start`, `text`, `tool_call_start`, `tool_call` and `done` events. Fails over to the next leg only before the first event.
+- `chatTools(args)`: the same turn buffered, returning `{ text, toolCalls, finishReason, usage, raw, provider, model }`. Fails over on any error, mid-response included.
+- OpenAI-format function tools in (`ToolDefinition`), normalized `ToolCall { id, name, arguments }` out. Conversation messages carry `assistant.toolCalls` and `{ role: "tool", toolCallId, content, isError? }` results.
+- Provider chain unchanged: OCP, ocp-fallback, Anthropic (tools and tool results translated to Anthropic blocks, prompt-cache breakpoints on system parts, last tool and last message), then Workers AI for text-only turns only.
+- `system` may be an array of parts with `cache_control`, so a caller keeps a cached stable block and a volatile tail on the Anthropic leg.
+- `effort` (OCP `reasoning_effort`, Anthropic `output_config.effort`), `anthropic` extra fields for the Anthropic leg only (e.g. `thinking`), and `signal` (abort never fails over).
+- `toolsFromAnthropic()` converts Anthropic `input_schema` tools.
+- `llm.call` lines from the new API carry `mode` (`stream` or `tools`) and `toolCalls`.
+- 10 new black-box tests (`test/tools.test.mjs`).
+
+### Not in the Python twin
+`brick_llm.py` gets no tools or streaming API in this release; no Python consumer calls tools.
+
+### Consumers to bump
+brick.sticks (moves Kit chat, voice and the task sweep onto `chatStream` / `chatTools`). Others only if they adopt the new API.
+
 ## 0.7.0 (2026-10-11)
 
 Exported API unchanged. Model defaults change; provider order does not.

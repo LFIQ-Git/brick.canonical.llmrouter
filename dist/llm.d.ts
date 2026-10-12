@@ -88,4 +88,110 @@ export declare function chatDetailed(args: ChatArgs): Promise<ChatResult>;
 export declare function chatWithRetry(args: ChatArgs): Promise<string>;
 export declare function chatDetailedWithRetry(args: ChatArgs): Promise<ChatResult>;
 export declare function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T>;
+/** OpenAI-format function tool. */
+export interface ToolDefinition {
+    type: "function";
+    function: {
+        name: string;
+        description?: string;
+        /** JSON Schema for the arguments object. */
+        parameters?: Record<string, unknown>;
+    };
+}
+/** A tool call the model made, normalized across providers. */
+export interface ToolCall {
+    /** Provider call id; send it back as `toolCallId` on the result. */
+    id: string;
+    name: string;
+    /** Parsed arguments ({} when the model sent none or unparseable JSON). */
+    arguments: Record<string, unknown>;
+}
+export type ToolChatMessage = {
+    role: "user";
+    content: string;
+} | {
+    role: "assistant";
+    content: string;
+    toolCalls?: ToolCall[];
+} | {
+    role: "tool";
+    toolCallId: string;
+    content: string;
+    isError?: boolean;
+};
+/** One part of a multi-part system prompt. `cache_control` marks a prompt-cache
+ *  breakpoint on the Anthropic leg; OpenAI-shape legs join the parts' text. */
+export interface SystemPart {
+    text: string;
+    cache_control?: {
+        type: "ephemeral";
+    };
+}
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type FinishReason = "stop" | "tool_calls" | "length" | "other";
+export interface ToolChatArgs {
+    /** A string, or parts (e.g. a cached stable block and a volatile tail). */
+    system: string | SystemPart[];
+    messages: ToolChatMessage[];
+    /** Function tools the model may call. Omit or [] for a text-only turn. */
+    tools?: ToolDefinition[];
+    /** "auto" (default) or "none". Forcing a tool is not offered: OCP refuses it. */
+    toolChoice?: "auto" | "none";
+    model?: string;
+    tier?: ModelTier;
+    /** Defaults to 8192. */
+    maxTokens?: number;
+    temperature?: number;
+    /** OCP legs: `reasoning_effort`. Anthropic leg: `output_config.effort`. */
+    effort?: ReasoningEffort;
+    /** Extra request fields sent on the Anthropic leg only (e.g. `thinking`). */
+    anthropic?: Record<string, unknown>;
+    /** Aborts the in-flight request. An aborted call never fails over. */
+    signal?: AbortSignal;
+}
+export interface ToolChatResult extends ChatResult {
+    toolCalls: ToolCall[];
+    finishReason: FinishReason;
+    /** The model id the answering leg ran. */
+    model: string;
+}
+export type ChatStreamEvent = {
+    type: "start";
+    provider: Provider;
+    model: string;
+} | {
+    type: "text";
+    text: string;
+} | {
+    type: "tool_call_start";
+    index: number;
+    id: string;
+    name: string;
+} | {
+    type: "tool_call";
+    call: ToolCall;
+} | {
+    type: "done";
+    result: ToolChatResult;
+};
+/** Convert Anthropic-format tools (`{ name, description, input_schema }`) to
+ *  OpenAI function tools, for callers migrating from the Anthropic SDK. */
+export declare function toolsFromAnthropic(tools: ReadonlyArray<{
+    name: string;
+    description?: string;
+    input_schema?: unknown;
+}>): ToolDefinition[];
+/**
+ * Stream one model turn with optional function tools. Yields `start`
+ * (provider + model), `text` deltas, `tool_call_start`, `tool_call` and a
+ * final `done` carrying the full `ToolChatResult`. Fails over to the next leg
+ * only before the first event; after that an error is thrown.
+ */
+export declare function chatStream(args: ToolChatArgs): AsyncGenerator<ChatStreamEvent>;
+/**
+ * One model turn with optional function tools, not streamed to the caller.
+ * Returns the text, normalized tool calls and finish reason. Fails over to the
+ * next leg on any error, mid-response included.
+ */
+export declare function chatTools(args: ToolChatArgs): Promise<ToolChatResult>;
 //# sourceMappingURL=llm.d.ts.map
