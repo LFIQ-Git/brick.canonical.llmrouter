@@ -351,7 +351,7 @@ test("exported API surface is unchanged", async () => {
   ]) {
     assert.ok(name in L, `missing export ${name}`);
   }
-  assert.deepEqual(Object.keys(L.MODEL_TIERS).sort(), ["balanced", "deep", "fast"]);
+  assert.deepEqual(Object.keys(L.MODEL_TIERS).sort(), ["balanced", "deep", "fast", "standard"]);
 });
 
 test("tier defaults: fast haiku-4-5, balanced and deep sonnet-5-5", async () => {
@@ -365,6 +365,7 @@ test("tier defaults: fast haiku-4-5, balanced and deep sonnet-5-5", async () => 
     assert.deepEqual(L.MODEL_TIERS, {
       fast: "claude-haiku-4-5",
       balanced: "claude-sonnet-5-5",
+      standard: "claude-sonnet-5-5",
       deep: "claude-sonnet-5-5",
     });
     assert.equal(L.DEFAULT_LLM_MODEL, "claude-sonnet-5-5");

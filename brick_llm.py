@@ -52,7 +52,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, TypedDict, TypeVar
+from typing import Tuple, Any, Awaitable, Callable, Dict, List, Literal, Optional, TypedDict, TypeVar
 
 Provider = Literal["ocp", "anthropic"]
 ModelTier = Literal["fast", "balanced", "deep"]
@@ -215,6 +215,9 @@ class ChatArgs:
     messages: List[ChatMessage]
     #: Explicit model ID. Wins over ``tier``.
     model: Optional[str] = None
+    #: Task key, app.task in lowercase ("keystone.triage"). Picks a per-task
+    #: route and is what ai.runs records. Defaults to "<LLM_APP_NAME>.<tier>".
+    task: Optional[str] = None
     #: Capability tier — resolved via MODEL_TIERS when ``model`` is absent.
     tier: Optional[ModelTier] = None
     #: Defaults to 8192.
@@ -292,6 +295,168 @@ def _log_call(
         sys.stdout.write(f"llm.call {json.dumps(rec)}\n")
     except Exception:  # noqa: BLE001 — logging must never throw
         pass
+
+
+# ── control plane: ai.routes / ai.runs on brickston-backend ─────────────
+# Twin of the llm.ts block. With AI_CONTROL_URL + AI_CONTROL_SECRET set, routes
+# come from GET /api/v1/ai/config?router=brick (cached 60 s) and every call is
+# appended to ai.runs via POST /api/v1/ai/runs. A failure never fails a call.
+ROUTE_TTL_S = 60.0
+CONTROL_TIMEOUT_S = 2.0
+_ctl: Dict[str, Any] = {"at": 0.0, "routes": None, "cap": None, "spent": None, "queue": []}
+
+
+def _control() -> Optional[Tuple[str, Dict[str, str]]]:
+    url = (os.environ.get("AI_CONTROL_URL") or "").strip().rstrip("/")
+    secret = (os.environ.get("AI_CONTROL_SECRET") or "").strip()
+    if not url or not secret:
+        return None
+    return url, {"x-scheduler-secret": secret, "content-type": "application/json"}
+
+
+def _http_json(method: str, url: str, headers: Dict[str, str], body: Any = None) -> Any:
+    import urllib.request
+
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=CONTROL_TIMEOUT_S) as r:  # noqa: S310 — fixed backend URL
+        raw = r.read()
+        return json.loads(raw) if raw else None
+
+
+def refresh_routes(force: bool = False) -> None:
+    """Fetch the route table when the cached copy is older than 60 s. Never raises."""
+    ctl = _control()
+    if ctl is None:
+        return
+    if not force and time.time() - _ctl["at"] < ROUTE_TTL_S:
+        return
+    url, headers = ctl
+    try:
+        j = _http_json("GET", f"{url}/api/v1/ai/config?router=brick", headers)
+        if isinstance(j, dict) and isinstance(j.get("routes"), list):
+            _ctl["routes"] = j["routes"]
+            _ctl["cap"] = float(j.get("daily_paid_cap_usd") or 0)
+            _ctl["spent"] = float(j.get("today_paid_usd") or 0)
+    except Exception:  # noqa: BLE001 — keep the previous table
+        pass
+    finally:
+        _ctl["at"] = time.time()
+
+
+def table_tier(tier: Optional[str]) -> str:
+    """ai.routes tier for a router tier: balanced and standard are the same tier."""
+    return tier if tier in ("fast", "deep") else "standard"
+
+
+def _app_name() -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", (os.environ.get("LLM_APP_NAME") or "unknown").strip().lower())
+
+
+def task_env_name(task: str) -> str:
+    return "AI_ROUTE_" + re.sub(r"[^A-Z0-9]+", "_", task.upper())
+
+
+def parse_route_override(spec: str) -> List[Dict[str, str]]:
+    legs = []
+    for part in spec.split(","):
+        s = part.strip()
+        provider, _, model = s.partition(":")
+        if not provider or not model.strip():
+            raise ValueError(f'bad route leg "{s}": use provider:model')
+        if provider not in ("ocp", "anthropic"):
+            raise ValueError(f'route provider "{provider}" is not allowed on the BRICK router (ocp or anthropic)')
+        legs.append({"provider": provider, "model": model.strip()})
+    return legs
+
+
+def _legs_to_models(legs: List[Dict[str, str]]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for leg in legs:
+        if leg.get("provider") == "ocp" and "ocp_model" not in out:
+            out["ocp_model"] = leg["model"]
+        if leg.get("provider") == "anthropic" and "anthropic_model" not in out:
+            out["anthropic_model"] = leg["model"]
+    return out
+
+
+def resolve_route(task: Optional[str], tier: Optional[str], model: Optional[str]) -> Dict[str, Any]:
+    """Models for one call: explicit model, AI_ROUTE_<TASK>, the ai.routes table, then MODEL_TIERS.
+    Applies the daily paid cap to table routes (step down past 80%, hold at the cap)."""
+    t = table_tier(tier)
+    key = task or f"{_app_name()}.{t}"
+    if model:
+        return {"task": key, "tier": t, "ocp_model": model, "anthropic_model": model, "source": "model", "budget": "ok"}
+    override = (os.environ.get(task_env_name(task)) or "").strip() if task else ""
+    if override:
+        return {"task": key, "tier": t, **_legs_to_models(parse_route_override(override)), "source": "override", "budget": "ok"}
+    refresh_routes()
+    routes = _ctl["routes"]
+    if routes:
+        route = next((r for r in routes if task and r.get("task") == task), None) or next(
+            (r for r in routes if r.get("task") is None and r.get("tier") == t), None
+        )
+        if route:
+            models = _legs_to_models([route["primary"]] + ([route["fallback"]] if route.get("fallback") else []))
+            budget = "ok"
+            cap, spent = _ctl["cap"] or 0.0, _ctl["spent"] or 0.0
+            if cap > 0 and spent >= cap:
+                budget = "held"
+                models.pop("anthropic_model", None)
+            elif cap > 0 and spent >= cap * 0.8 and route.get("tier") == "standard":
+                fast = next((r for r in routes if r.get("task") is None and r.get("tier") == "fast"), None)
+                paid = _legs_to_models([fast["primary"]] + ([fast["fallback"]] if fast.get("fallback") else [])).get("anthropic_model") if fast else None
+                if paid:
+                    budget = "step_down"
+                    models["anthropic_model"] = paid
+            return {"task": key, "tier": route.get("tier", t), **models, "source": "table", "budget": budget}
+    m = _model_tiers()[tier] if tier else default_llm_model()  # type: ignore[index]
+    return {"task": key, "tier": t, "ocp_model": m, "anthropic_model": m, "source": "builtin", "budget": "ok"}
+
+
+def _enqueue_run(route: Dict[str, Any], provider: str, model: str, usage: Optional[ChatUsage],
+                 latency_ms: int, ok: bool, failed_over: bool, err: Optional[str]) -> None:
+    if _control() is None:
+        return
+    run: Dict[str, Any] = {
+        "router": "brick", "app": route["task"].split(".")[0], "task": route["task"], "tier": route["tier"],
+        "provider": provider, "model": model, "latency_ms": latency_ms, "fell_back": failed_over, "ok": ok,
+    }
+    if usage and usage.get("input_tokens") is not None:
+        run["input_tokens"] = usage["input_tokens"]
+    if usage and usage.get("output_tokens") is not None:
+        run["output_tokens"] = usage["output_tokens"]
+    if err:
+        run["error"] = err[:300]
+    q = _ctl["queue"]
+    q.append(run)
+    del q[:-500]
+
+
+def flush_runs() -> None:
+    """Send queued runs to ai.runs (2 s cap). Never raises."""
+    ctl = _control()
+    if ctl is None or not _ctl["queue"]:
+        return
+    url, headers = ctl
+    batch = _ctl["queue"][:100]
+    del _ctl["queue"][:100]
+    try:
+        _http_json("POST", f"{url}/api/v1/ai/runs", headers, {"runs": batch})
+    except Exception:  # noqa: BLE001 — dropped; logging never fails a call
+        pass
+
+
+def anthropic_text_settings(model: str, max_tokens: int, temperature: Optional[float]) -> Dict[str, Any]:
+    """Per-model settings (twin of anthropicTextSettings): thinking tokens count against max_tokens."""
+    if model == "claude-sonnet-5-5":
+        return {"max_tokens": max_tokens, "thinking": {"type": "between_tools"}}
+    if re.match(r"^claude-(opus-5|fable-5|haiku-5)", model):
+        return {"max_tokens": max_tokens + 4096, "output_config": {"effort": "low"}}
+    out: Dict[str, Any] = {"max_tokens": max_tokens}
+    if temperature is not None:
+        out["temperature"] = temperature
+    return out
 
 
 # ── error redaction — nothing secret reaches a log line ──────────────────
@@ -453,14 +618,12 @@ def _call_anthropic(
     a = _get_anthropic()
     kwargs: Dict[str, Any] = {
         "model": model,
-        "max_tokens": max_tokens,
+        **anthropic_text_settings(model, max_tokens, temperature),
         "system": [
             {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
         ],
         "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
     }
-    if temperature is not None:
-        kwargs["temperature"] = temperature
     r = a.messages.create(**kwargs)
     block = next((b for b in r.content if getattr(b, "type", None) == "text"), None)
     text = block.text if block is not None and getattr(block, "type", None) == "text" else ""
@@ -479,76 +642,66 @@ def _call_anthropic(
 
 # ── core routing + failover ──────────────────────────────────────────────
 def _run_chat(args: ChatArgs) -> ChatResult:
-    """Core routing + failover. Returns the rich result. ``chat()`` and
-    ``chat_detailed()`` are thin wrappers over this.
+    """Routing + failover, then send this call's runs to ai.runs."""
+    try:
+        return _run_chat_legs(args)
+    finally:
+        flush_runs()
 
-    Routing: primary provider per ``get_provider()``. If the primary is OCP
-    and it errors transiently — or its circuit breaker is open — the call
-    fails over to Anthropic when ANTHROPIC_API_KEY is set. Anthropic-primary
-    does not fail over to OCP (it is the more reliable leg).
+
+def _run_chat_legs(args: ChatArgs) -> ChatResult:
+    """Core routing + failover. OCP first when OCP_BASE_URL is set and the route
+    has an OCP model, then Anthropic when the route has a paid model and
+    ANTHROPIC_API_KEY is set. Models come from ``resolve_route``.
     """
-    resolved = _resolve_model(args)
-    model = resolved["model"] or default_llm_model()
-    tier = resolved["tier"]  # type: ignore[assignment]
+    route = resolve_route(args.task, args.tier, args.model)
+    tier = args.tier
+    ocp_model = route.get("ocp_model")
+    paid_model = route.get("anthropic_model")
     max_tokens = args.max_tokens if args.max_tokens is not None else 8192
     primary = get_provider()
-    anthropic_available = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    started = _now_ms()
+    anthropic_available = bool(os.environ.get("ANTHROPIC_API_KEY")) and bool(paid_model)
 
-    # OCP primary (unless its breaker is open) → fail over to Anthropic.
-    if primary == "ocp" and not _ocp_breaker_open():
+    if primary == "ocp" and ocp_model and not _ocp_breaker_open():
+        started = _now_ms()
         try:
-            out = _call_ocp(
-                args.system, args.messages, model, max_tokens, args.temperature
-            )
+            out = _call_ocp(args.system, args.messages, ocp_model, max_tokens, args.temperature)
             _note_ocp_result(True)
-            _log_call("ocp", model, tier, int(_now_ms() - started), ok=True)
-            return ChatResult(
-                text=out.text, usage=out.usage, raw=out.raw, provider="ocp"
-            )
+            ms = int(_now_ms() - started)
+            _log_call("ocp", ocp_model, tier, ms, ok=True)
+            _enqueue_run(route, "ocp", ocp_model, out.usage, ms, True, False, None)
+            return ChatResult(text=out.text, usage=out.usage, raw=out.raw, provider="ocp")
         except Exception as e:  # noqa: BLE001 — routed to failover / re-raised
             _note_ocp_result(False)
             err = _redact_err(e)
+            ms = int(_now_ms() - started)
+            _log_call("ocp", ocp_model, tier, ms, ok=False, err=err)
+            _enqueue_run(route, "ocp", ocp_model, None, ms, False, False, err)
             if not anthropic_available:
-                _log_call(
-                    "ocp", model, tier, int(_now_ms() - started), ok=False, err=err
-                )
                 raise
-            # fall through to Anthropic failover
-            _log_call(
-                "ocp", model, tier, int(_now_ms() - started), ok=False, err=err
-            )
 
-    fell_over = primary == "ocp"
+    if not anthropic_available or not paid_model:
+        if route.get("budget") == "held":
+            raise RuntimeError(f"Daily paid AI cap reached for the BRICK router; {route['task']} has no free leg that answered.")
+        raise RuntimeError("No LLM provider configured: set ANTHROPIC_API_KEY or OCP_BASE_URL.")
+
+    fell_over = primary == "ocp" and bool(ocp_model)
     a_started = _now_ms()
     try:
-        out = _call_anthropic(
-            args.system, args.messages, model, max_tokens, args.temperature
-        )
+        out = _call_anthropic(args.system, args.messages, paid_model, max_tokens, args.temperature)
+        ms = int(_now_ms() - a_started)
         _log_call(
-            "anthropic",
-            model,
-            tier,
-            int(_now_ms() - a_started),
-            ok=True,
-            failed_over=fell_over,
+            "anthropic", paid_model, tier, ms, ok=True, failed_over=fell_over,
             cache_write=out.usage.get("cache_creation_input_tokens"),
             cache_read=out.usage.get("cache_read_input_tokens"),
         )
-        return ChatResult(
-            text=out.text, usage=out.usage, raw=out.raw, provider="anthropic"
-        )
+        _enqueue_run(route, "anthropic", paid_model, out.usage, ms, True, fell_over, None)
+        return ChatResult(text=out.text, usage=out.usage, raw=out.raw, provider="anthropic")
     except Exception as e:  # noqa: BLE001 — re-raised after logging
         err = _redact_err(e)
-        _log_call(
-            "anthropic",
-            model,
-            tier,
-            int(_now_ms() - a_started),
-            ok=False,
-            failed_over=fell_over,
-            err=err,
-        )
+        ms = int(_now_ms() - a_started)
+        _log_call("anthropic", paid_model, tier, ms, ok=False, failed_over=fell_over, err=err)
+        _enqueue_run(route, "anthropic", paid_model, None, ms, False, fell_over, err)
         raise
 
 

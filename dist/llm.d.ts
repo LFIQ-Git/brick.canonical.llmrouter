@@ -1,5 +1,6 @@
 export type Provider = "ocp" | "ocp-fallback" | "anthropic" | "workers-ai";
-export type ModelTier = "fast" | "balanced" | "deep";
+/** "standard" is the AI Model Usage Plan's name for "balanced"; both resolve the same way. */
+export type ModelTier = "fast" | "balanced" | "standard" | "deep";
 /** Tier → model ID. One place to bump models family-wide. Keep IDs inside
  *  the OCP proxy allowlist. */
 export declare const MODEL_TIERS: Record<ModelTier, string>;
@@ -11,6 +12,12 @@ export interface ChatMessage {
     content: string;
 }
 export interface ChatArgs {
+    /**
+     * Task key, app.task in lowercase ("intel.brief"). Picks a per-task route on
+     * the AI Console Models page and is what ai.runs records. Defaults to
+     * `<LLM_APP_NAME>.<tier>`.
+     */
+    task?: string;
     /** System / instruction text. Cache hint applied on the Anthropic path. */
     system: string;
     /** Conversation messages — usually one user message; multi-turn supported. */
@@ -41,6 +48,65 @@ export interface ChatResult {
     /** The provider that actually produced this answer (post-failover). */
     provider: Provider;
 }
+/** One leg of a route as the backend reports it. */
+export interface RouteLegConfig {
+    provider: string;
+    model: string;
+}
+/** A tier default (task null) or a per-task override. */
+export interface RouteConfig {
+    tier: string;
+    task: string | null;
+    primary: RouteLegConfig;
+    fallback: RouteLegConfig | null;
+}
+/** One finished call. Matches the columns of ai.runs. */
+export interface RunRecord {
+    router: "brick";
+    app: string;
+    task: string;
+    tier: string;
+    provider: Provider;
+    model: string;
+    input_tokens?: number;
+    output_tokens?: number;
+    latency_ms: number;
+    fell_back: boolean;
+    ok: boolean;
+    error?: string;
+}
+/** Fetch the route table when the cached copy is older than 60 s. Never throws. */
+export declare function refreshRoutes(force?: boolean): Promise<void>;
+/** Receive every finished call as well (metrics, tests). Errors in the hook are swallowed. */
+export declare function onRun(hook: ((rec: RunRecord) => void | Promise<void>) | null): void;
+/** ai.routes tier for a router tier: balanced and standard are the same tier. */
+export declare function tableTier(tier?: ModelTier): "fast" | "standard" | "deep";
+/** Send queued runs to ai.runs. Awaited at the end of every call (2 s cap). Never throws. */
+export declare function flushRuns(): Promise<void>;
+/** What a call will try: the OCP model and the paid (Anthropic) model, either may be absent. */
+export interface ResolvedRoute {
+    task: string;
+    tier: string;
+    ocpModel?: string;
+    anthropicModel?: string;
+    source: "model" | "override" | "table" | "builtin";
+    budget: "ok" | "step_down" | "held";
+}
+export declare function taskEnvName(task: string): string;
+/** Parse "ocp:claude-sonnet-5-5,anthropic:claude-sonnet-5-5". */
+export declare function parseRouteOverride(spec: string): RouteLegConfig[];
+/**
+ * Resolve the models for one call. Order: an explicit `model`, then
+ * AI_ROUTE_<TASK>, then the ai.routes table (task override, else tier default),
+ * then MODEL_TIERS. The daily paid cap applies to table routes: past 80% the
+ * standard tier's paid model steps down to the fast tier's, and at the cap
+ * paid legs are skipped.
+ */
+export declare function resolveRoute(args: {
+    task?: string;
+    tier?: ModelTier;
+    model?: string;
+}): Promise<ResolvedRoute>;
 /** One provider call's normalized output (text + usage + raw response). */
 export interface ProviderOutput {
     text: string;
@@ -74,6 +140,15 @@ export interface WorkersAiBinding {
  * catalog returns: `{ response: string }` and OpenAI-style `{ choices: [...] }`.
  */
 export declare function workersAiRunnerFromBinding(ai: WorkersAiBinding): WorkersAiRunner;
+/**
+ * Per-model settings for a plain text call. Thinking tokens count against
+ * max_tokens, so a model that thinks by default needs thinking off or room.
+ * Haiku 4.x does not think by default and takes sampling settings; Sonnet 5.5
+ * thinks by default, rejects sampling settings, and turns thinking off with
+ * `between_tools`; other current models think always, so they get low effort
+ * and headroom. Older models pass through unchanged.
+ */
+export declare function anthropicTextSettings(model: string, maxTokens: number, temperature?: number): Record<string, unknown>;
 /**
  * Single round-trip chat. Returns the model's text ("" if none). For token
  * counts or the raw provider response, use `chatDetailed()`.
@@ -137,6 +212,8 @@ export interface ToolChatArgs {
     tools?: ToolDefinition[];
     /** "auto" (default) or "none". Forcing a tool is not offered: OCP refuses it. */
     toolChoice?: "auto" | "none";
+    /** Task key for routing overrides and ai.runs (see ChatArgs.task). */
+    task?: string;
     model?: string;
     tier?: ModelTier;
     /** Defaults to 8192. */

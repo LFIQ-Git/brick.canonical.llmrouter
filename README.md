@@ -66,6 +66,18 @@ together** → push → bump the SHA pin in each consumer. CI runs
   token counts), and `ChatUsage` carries `cache_creation_input_tokens` /
   `cache_read_input_tokens`.
 
+## Route table and run log (0.9.0)
+
+Pass a task key: `chat({ task: "intel.brief", tier: "balanced", system, messages })`. Then set three env vars:
+
+| Name | Value |
+|---|---|
+| `AI_CONTROL_URL` | `https://brickston-backend.fly.dev` |
+| `AI_CONTROL_SECRET` | The backend's scheduler secret |
+| `LLM_APP_NAME` | The app, for example `intel` |
+
+With those set, models come from the AI Console Models page (`ai.routes`, cached 60 s), and every call is written to `ai.runs` with its cost. `AI_ROUTE_<TASK>="ocp:claude-sonnet-5-5,anthropic:claude-sonnet-5-5"` overrides one task. The daily paid cap steps the standard tier down to fast past 80% and holds paid legs at 100%. Without the env vars the router uses `MODEL_TIERS`, as before.
+
 ## Consumers (SHA pins to bump on release)
 
 | App | Shim | Pin location |
@@ -119,6 +131,7 @@ source of truth**; re-sync the mirror after each release.
 
 ## Env contract
 
+`AI_CONTROL_URL`, `AI_CONTROL_SECRET`, `LLM_APP_NAME` — route table + run log (0.9.0);
 `OCP_BASE_URL`, `OCP_API_KEY` — Win-PC OCP proxy;
 `OCP_CF_ACCESS_CLIENT_ID` / `OCP_CF_ACCESS_CLIENT_SECRET` — Cloudflare Access
 service token sent to the OCP gateway. `OCP_FALLBACK_BASE_URL`,

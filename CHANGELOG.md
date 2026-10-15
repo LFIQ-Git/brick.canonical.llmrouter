@@ -2,6 +2,30 @@
 
 All notable changes to `@lfiq/canonical-llm`. Consumers pin by commit SHA; bump the pin to pick up a release.
 
+## 0.9.0 (2026-10-15)
+
+Phase 2 of the AI Model Usage Plan. Additive, apart from the Sonnet 5.5 change noted below. With no new env vars set, routing is the same as 0.8.0.
+
+### Added
+- **Task keys.** `chat`, `chatDetailed`, `chatStream` and `chatTools` take a `task` ("intel.brief"). It defaults to `<LLM_APP_NAME>.<tier>`.
+- **Route table.** With `AI_CONTROL_URL` (brickston-backend) and `AI_CONTROL_SECRET` (its scheduler secret) set, models come from `GET /api/v1/ai/config?router=brick`, which is `ai.routes` edited on the AI Console Models page. The table is cached for 60 s. Lookup order:
+  1. an explicit `model`
+  2. `AI_ROUTE_<TASK>`
+  3. the task override in the table
+  4. the tier default in the table
+  5. `MODEL_TIERS`
+
+  A route with no OCP leg skips OCP. A route with no paid leg (Deep) never falls back to the API.
+- **Run log.** Every call is posted to `POST /api/v1/ai/runs`, so it lands in `ai.runs` and the Models page spend view. The post is awaited with a 2 s cap and never fails a call. `onRun(hook)` and `flushRuns()` are exported as well.
+- **Budget guard.** The daily paid cap applies to table routes:
+  - Past 80%, the standard tier's paid model steps down to the fast tier's.
+  - At the cap, paid legs are skipped.
+- `"standard"` is accepted as a tier, the same as `"balanced"`.
+- Python twin `brick_llm.py`: the same task, table, override, budget and run-log behavior (`resolve_route`, `refresh_routes`, `flush_runs`, `ChatArgs.task`).
+
+### Changed
+- On the Anthropic leg, `claude-sonnet-5-5` is sent with `thinking: {type: "between_tools"}` and without sampling settings. It thinks by default, and the thinking spent `max_tokens`, which truncated answers. Haiku 4.x is unchanged. Opus 5.x, Fable 5 and Haiku 5.x get low effort plus 4,096 tokens of headroom.
+
 ## 0.8.0 (2026-10-12)
 
 Additive. Existing exports and the text API are unchanged; safe to bump from 0.7.0.
