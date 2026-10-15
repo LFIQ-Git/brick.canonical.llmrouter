@@ -47,13 +47,15 @@ import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 
 export type Provider = "ocp" | "ocp-fallback" | "anthropic" | "workers-ai";
-export type ModelTier = "fast" | "balanced" | "deep";
+/** "standard" is the AI Model Usage Plan's name for "balanced"; both resolve the same way. */
+export type ModelTier = "fast" | "balanced" | "standard" | "deep";
 
 /** Tier → model ID. One place to bump models family-wide. Keep IDs inside
  *  the OCP proxy allowlist. */
 export const MODEL_TIERS: Record<ModelTier, string> = {
   fast: process.env.LLM_MODEL_FAST ?? "claude-haiku-4-5",
   balanced: process.env.LLM_MODEL_BALANCED ?? "claude-sonnet-5-5",
+  standard: process.env.LLM_MODEL_BALANCED ?? "claude-sonnet-5-5",
   deep: process.env.LLM_MODEL_DEEP ?? "claude-sonnet-5-5",
 };
 
@@ -189,6 +191,12 @@ export interface ChatMessage {
 }
 
 export interface ChatArgs {
+  /**
+   * Task key, app.task in lowercase ("intel.brief"). Picks a per-task route on
+   * the AI Console Models page and is what ai.runs records. Defaults to
+   * `<LLM_APP_NAME>.<tier>`.
+   */
+  task?: string;
   /** System / instruction text. Cache hint applied on the Anthropic path. */
   system: string;
   /** Conversation messages — usually one user message; multi-turn supported. */
@@ -227,6 +235,10 @@ function logCall(rec: {
   provider: Provider;
   model: string;
   tier?: ModelTier;
+  /** Task key and table tier, for ai.runs. */
+  task?: string;
+  routeTier?: string;
+  usage?: ChatUsage;
   latencyMs: number;
   ok: boolean;
   failedOver?: boolean;
@@ -251,6 +263,266 @@ function logCall(rec: {
   } catch {
     /* logging must never throw */
   }
+  enqueueRun(rec);
+}
+
+// ── control plane: ai.routes / ai.runs on brickston-backend ─────────────
+// Phase 2 of the AI Model Usage Plan. With AI_CONTROL_URL (the backend base
+// URL) and AI_CONTROL_SECRET (its scheduler secret) set, the router reads its
+// routes from GET /api/v1/ai/config?router=brick (cached 60 s) and appends
+// every call to ai.runs via POST /api/v1/ai/runs. Without them it behaves as
+// before: MODEL_TIERS, logs only. A control-plane failure never fails a call.
+
+/** One leg of a route as the backend reports it. */
+export interface RouteLegConfig {
+  provider: string;
+  model: string;
+}
+
+/** A tier default (task null) or a per-task override. */
+export interface RouteConfig {
+  tier: string;
+  task: string | null;
+  primary: RouteLegConfig;
+  fallback: RouteLegConfig | null;
+}
+
+/** One finished call. Matches the columns of ai.runs. */
+export interface RunRecord {
+  router: "brick";
+  app: string;
+  task: string;
+  tier: string;
+  provider: Provider;
+  model: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  latency_ms: number;
+  fell_back: boolean;
+  ok: boolean;
+  error?: string;
+}
+
+interface ControlState {
+  at: number;
+  routes: RouteConfig[] | null;
+  cap: number | null;
+  spent: number | null;
+  inflight: Promise<void> | null;
+  queue: RunRecord[];
+  hook: ((rec: RunRecord) => void | Promise<void>) | null;
+}
+
+const ROUTE_TTL_MS = 60_000;
+const CONTROL_TIMEOUT_MS = 2_000;
+const RUN_QUEUE_MAX = 500;
+const CONTROL_KEY = "__brickLlmControl";
+const _gc = globalThis as unknown as Record<string, ControlState | undefined>;
+const _ctl: ControlState = (_gc[CONTROL_KEY] ??= {
+  at: 0,
+  routes: null,
+  cap: null,
+  spent: null,
+  inflight: null,
+  queue: [],
+  hook: null,
+});
+
+function controlUrl(): string | null {
+  const u = process.env.AI_CONTROL_URL?.trim();
+  return u ? u.replace(/\/$/, "") : null;
+}
+
+function controlHeaders(): Record<string, string> | null {
+  const s = process.env.AI_CONTROL_SECRET?.trim();
+  return s ? { "x-scheduler-secret": s, "content-type": "application/json" } : null;
+}
+
+/** Fetch the route table when the cached copy is older than 60 s. Never throws. */
+export async function refreshRoutes(force = false): Promise<void> {
+  const url = controlUrl();
+  const headers = controlHeaders();
+  if (!url || !headers) return;
+  if (!force && Date.now() - _ctl.at < ROUTE_TTL_MS) return;
+  if (_ctl.inflight) return _ctl.inflight;
+  _ctl.inflight = (async () => {
+    try {
+      const r = await fetch(`${url}/api/v1/ai/config?router=brick`, {
+        headers,
+        signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+      });
+      if (r.ok) {
+        const j = (await r.json()) as { routes?: RouteConfig[]; daily_paid_cap_usd?: unknown; today_paid_usd?: unknown };
+        if (Array.isArray(j.routes)) _ctl.routes = j.routes;
+        _ctl.cap = Number(j.daily_paid_cap_usd ?? NaN);
+        _ctl.spent = Number(j.today_paid_usd ?? NaN);
+      }
+    } catch {
+      /* keep the previous table */
+    } finally {
+      _ctl.at = Date.now();
+      _ctl.inflight = null;
+    }
+  })();
+  return _ctl.inflight;
+}
+
+/** Receive every finished call as well (metrics, tests). Errors in the hook are swallowed. */
+export function onRun(hook: ((rec: RunRecord) => void | Promise<void>) | null): void {
+  _ctl.hook = hook;
+}
+
+function appName(): string {
+  return (process.env.LLM_APP_NAME || "unknown").trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_");
+}
+
+/** ai.routes tier for a router tier: balanced and standard are the same tier. */
+export function tableTier(tier?: ModelTier): "fast" | "standard" | "deep" {
+  if (tier === "fast" || tier === "deep") return tier;
+  return "standard";
+}
+
+function enqueueRun(rec: {
+  provider: Provider;
+  model: string;
+  tier?: ModelTier;
+  task?: string;
+  routeTier?: string;
+  usage?: ChatUsage;
+  latencyMs: number;
+  ok: boolean;
+  failedOver?: boolean;
+  err?: string;
+}): void {
+  if (!rec.task || (!controlUrl() && !_ctl.hook)) return;
+  const run: RunRecord = {
+    router: "brick",
+    app: rec.task.split(".")[0],
+    task: rec.task,
+    tier: rec.routeTier ?? tableTier(rec.tier),
+    provider: rec.provider,
+    model: rec.model,
+    ...(rec.usage?.input_tokens !== undefined ? { input_tokens: rec.usage.input_tokens } : {}),
+    ...(rec.usage?.output_tokens !== undefined ? { output_tokens: rec.usage.output_tokens } : {}),
+    latency_ms: rec.latencyMs,
+    fell_back: Boolean(rec.failedOver),
+    ok: rec.ok,
+    ...(rec.err ? { error: rec.err.slice(0, 300) } : {}),
+  };
+  if (_ctl.hook) {
+    try {
+      void Promise.resolve(_ctl.hook(run)).catch(() => {});
+    } catch {
+      /* hook errors never fail a call */
+    }
+  }
+  if (controlUrl()) {
+    _ctl.queue.push(run);
+    if (_ctl.queue.length > RUN_QUEUE_MAX) _ctl.queue.splice(0, _ctl.queue.length - RUN_QUEUE_MAX);
+  }
+}
+
+/** Send queued runs to ai.runs. Awaited at the end of every call (2 s cap). Never throws. */
+export async function flushRuns(): Promise<void> {
+  const url = controlUrl();
+  const headers = controlHeaders();
+  if (!url || !headers || _ctl.queue.length === 0) return;
+  const batch = _ctl.queue.splice(0, 100);
+  try {
+    const r = await fetch(`${url}/api/v1/ai/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ runs: batch }),
+      signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+    });
+    if (r.ok && typeof _ctl.spent === "number") {
+      /* spend refreshes with the next route fetch */
+    }
+  } catch {
+    /* dropped: a logging failure never fails a call */
+  }
+}
+
+/** What a call will try: the OCP model and the paid (Anthropic) model, either may be absent. */
+export interface ResolvedRoute {
+  task: string;
+  tier: string;
+  ocpModel?: string;
+  anthropicModel?: string;
+  source: "model" | "override" | "table" | "builtin";
+  budget: "ok" | "step_down" | "held";
+}
+
+export function taskEnvName(task: string): string {
+  return `AI_ROUTE_${task.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+}
+
+function legsToModels(legs: RouteLegConfig[]): { ocpModel?: string; anthropicModel?: string } {
+  const out: { ocpModel?: string; anthropicModel?: string } = {};
+  for (const l of legs) {
+    if (l.provider === "ocp" && !out.ocpModel) out.ocpModel = l.model;
+    if (l.provider === "anthropic" && !out.anthropicModel) out.anthropicModel = l.model;
+  }
+  return out;
+}
+
+/** Parse "ocp:claude-sonnet-5-5,anthropic:claude-sonnet-5-5". */
+export function parseRouteOverride(spec: string): RouteLegConfig[] {
+  return spec.split(",").map((part) => {
+    const s = part.trim();
+    const i = s.indexOf(":");
+    const provider = s.slice(0, i);
+    const model = s.slice(i + 1).trim();
+    if (i < 1 || !model) throw new Error(`bad route leg "${s}": use provider:model`);
+    if (provider !== "ocp" && provider !== "anthropic") {
+      throw new Error(`route provider "${provider}" is not allowed on the BRICK router (ocp or anthropic)`);
+    }
+    return { provider, model };
+  });
+}
+
+/**
+ * Resolve the models for one call. Order: an explicit `model`, then
+ * AI_ROUTE_<TASK>, then the ai.routes table (task override, else tier default),
+ * then MODEL_TIERS. The daily paid cap applies to table routes: past 80% the
+ * standard tier's paid model steps down to the fast tier's, and at the cap
+ * paid legs are skipped.
+ */
+export async function resolveRoute(args: { task?: string; tier?: ModelTier; model?: string }): Promise<ResolvedRoute> {
+  const tier = tableTier(args.tier);
+  const task = args.task || `${appName()}.${tier}`;
+  if (args.model) return { task, tier, ocpModel: args.model, anthropicModel: args.model, source: "model", budget: "ok" };
+
+  const override = args.task ? process.env[taskEnvName(args.task)]?.trim() : undefined;
+  if (override) return { task, tier, ...legsToModels(parseRouteOverride(override)), source: "override", budget: "ok" };
+
+  await refreshRoutes();
+  const routes = _ctl.routes;
+  if (routes) {
+    const route =
+      (args.task ? routes.find((r) => r.task === args.task) : undefined) ??
+      routes.find((r) => r.task === null && r.tier === tier);
+    if (route) {
+      const models = legsToModels([route.primary, ...(route.fallback ? [route.fallback] : [])]);
+      let budget: ResolvedRoute["budget"] = "ok";
+      const cap = _ctl.cap ?? NaN;
+      const spent = _ctl.spent ?? NaN;
+      if (cap > 0 && spent >= cap) {
+        budget = "held";
+        delete models.anthropicModel;
+      } else if (cap > 0 && spent >= cap * 0.8 && route.tier === "standard") {
+        const fast = routes.find((r) => r.task === null && r.tier === "fast");
+        const fastPaid = fast ? legsToModels([fast.primary, ...(fast.fallback ? [fast.fallback] : [])]).anthropicModel : undefined;
+        if (fastPaid) {
+          budget = "step_down";
+          models.anthropicModel = fastPaid;
+        }
+      }
+      return { task, tier: route.tier, ...models, source: "table", budget };
+    }
+  }
+  const model = args.tier ? MODEL_TIERS[args.tier] : DEFAULT_LLM_MODEL;
+  return { task, tier, ocpModel: model, anthropicModel: model, source: "builtin", budget: "ok" };
 }
 
 // ── error redaction — nothing secret reaches a log line ──────────────────
@@ -467,6 +739,20 @@ const callOcp = (s: string, m: ChatMessage[], model: string, mt: number, t?: num
 const callOcpFallback = (s: string, m: ChatMessage[], model: string, mt: number, t?: number) =>
   callOpenAIShape(getOpenAIFallback(), s, m, model, mt, t);
 
+/**
+ * Per-model settings for a plain text call. Thinking tokens count against
+ * max_tokens, so a model that thinks by default needs thinking off or room.
+ * Haiku 4.x does not think by default and takes sampling settings; Sonnet 5.5
+ * thinks by default, rejects sampling settings, and turns thinking off with
+ * `between_tools`; other current models think always, so they get low effort
+ * and headroom. Older models pass through unchanged.
+ */
+export function anthropicTextSettings(model: string, maxTokens: number, temperature?: number): Record<string, unknown> {
+  if (model === "claude-sonnet-5-5") return { max_tokens: maxTokens, thinking: { type: "between_tools" } };
+  if (/^claude-(opus-5|fable-5|haiku-5)/.test(model)) return { max_tokens: maxTokens + 4096, output_config: { effort: "low" } };
+  return { max_tokens: maxTokens, ...(temperature !== undefined ? { temperature } : {}) };
+}
+
 async function callAnthropic(
   system: string,
   messages: ChatMessage[],
@@ -479,11 +765,10 @@ async function callAnthropic(
   const a = getAnthropic();
   const r = await a.messages.create({
     model,
-    max_tokens: maxTokens,
-    ...(temperature !== undefined ? { temperature } : {}),
+    ...(anthropicTextSettings(model, maxTokens, temperature) as { max_tokens: number }),
     system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
     messages: messages.map((m) => ({ role: m.role, content: m.content })),
-  });
+  } as Parameters<Anthropic["messages"]["create"]>[0]) as Anthropic.Message;
   const block = r.content.find((b) => b.type === "text");
   return {
     text: block && block.type === "text" ? block.text : "",
@@ -511,57 +796,76 @@ async function callAnthropic(
  * is opt-in and Anthropic-primary callers don't pay the latency of probing it.
  */
 async function runChat(args: ChatArgs): Promise<ChatResult> {
-  const { model, tier } = resolveModel(args);
+  try {
+    return await runChatLegs(args);
+  } finally {
+    await flushRuns();
+  }
+}
+
+async function runChatLegs(args: ChatArgs): Promise<ChatResult> {
+  const route = await resolveRoute(args);
+  const { task } = route;
+  const tier = args.tier;
+  const routeTier = route.tier;
   const maxTokens = args.maxTokens ?? 8192;
   const primary = getProvider();
-  const anthropicAvailable = Boolean(process.env.ANTHROPIC_API_KEY);
-  const fallbackAvailable = ocpFallbackConfigured();
+  const ocpModel = route.ocpModel;
+  const paidModel = route.anthropicModel;
+  const anthropicAvailable = Boolean(process.env.ANTHROPIC_API_KEY) && Boolean(paidModel);
+  const fallbackAvailable = ocpFallbackConfigured() && Boolean(paidModel);
+  const ctx = { tier, task, routeTier };
 
   // ── Leg 1: OCP (Win-PC) ────────────────────────────────────────────────
-  if (primary === "ocp" && !_ocpBreaker.open()) {
+  if (primary === "ocp" && ocpModel && !_ocpBreaker.open()) {
     const t = Date.now();
     try {
-      const out = await callOcp(args.system, args.messages, model, maxTokens, args.temperature);
+      const out = await callOcp(args.system, args.messages, ocpModel, maxTokens, args.temperature);
       _ocpBreaker.note(true);
-      logCall({ provider: "ocp", model, tier, latencyMs: Date.now() - t, ok: true });
+      logCall({ provider: "ocp", model: ocpModel, ...ctx, usage: out.usage, latencyMs: Date.now() - t, ok: true });
       return { ...out, provider: "ocp" };
     } catch (e) {
       _ocpBreaker.note(false);
       const err = redactErr(e);
-      logCall({ provider: "ocp", model, tier, latencyMs: Date.now() - t, ok: false, err });
+      logCall({ provider: "ocp", model: ocpModel, ...ctx, latencyMs: Date.now() - t, ok: false, err });
       if (!fallbackAvailable && !anthropicAvailable && !workersAiRunner()) throw e;
       // fall through
     }
   }
 
   // ── Leg 2: ocp-fallback (hosted) ───────────────────────────────────────
-  if (primary === "ocp" && fallbackAvailable && !_ocpFallbackBreaker.open()) {
+  if (primary === "ocp" && paidModel && fallbackAvailable && !_ocpFallbackBreaker.open()) {
     const t = Date.now();
     try {
-      const out = await callOcpFallback(args.system, args.messages, model, maxTokens, args.temperature);
+      const out = await callOcpFallback(args.system, args.messages, paidModel, maxTokens, args.temperature);
       _ocpFallbackBreaker.note(true);
-      logCall({ provider: "ocp-fallback", model, tier, latencyMs: Date.now() - t, ok: true, failedOver: true });
+      logCall({ provider: "ocp-fallback", model: paidModel, ...ctx, usage: out.usage, latencyMs: Date.now() - t, ok: true, failedOver: true });
       return { ...out, provider: "ocp-fallback" };
     } catch (e) {
       _ocpFallbackBreaker.note(false);
       const err = redactErr(e);
-      logCall({ provider: "ocp-fallback", model, tier, latencyMs: Date.now() - t, ok: false, failedOver: true, err });
+      logCall({ provider: "ocp-fallback", model: paidModel, ...ctx, latencyMs: Date.now() - t, ok: false, failedOver: true, err });
       if (!anthropicAvailable && !workersAiRunner()) throw e;
       // fall through
     }
   }
 
   // ── Leg 3: Anthropic direct SDK ────────────────────────────────────────
-  const fellOver = primary === "ocp";
-  let lastErr: unknown = new Error("No LLM provider configured: set ANTHROPIC_API_KEY or OCP_BASE_URL.");
-  if (anthropicAvailable) {
+  const fellOver = primary === "ocp" && Boolean(ocpModel);
+  let lastErr: unknown = new Error(
+    route.budget === "held"
+      ? `Daily paid AI cap reached for the BRICK router; ${task} has no free leg that answered.`
+      : "No LLM provider configured: set ANTHROPIC_API_KEY or OCP_BASE_URL.",
+  );
+  if (anthropicAvailable && paidModel) {
     const t = Date.now();
     try {
-      const out = await callAnthropic(args.system, args.messages, model, maxTokens, args.temperature);
+      const out = await callAnthropic(args.system, args.messages, paidModel, maxTokens, args.temperature);
       logCall({
         provider: "anthropic",
-        model,
-        tier,
+        model: paidModel,
+        ...ctx,
+        usage: out.usage,
         latencyMs: Date.now() - t,
         ok: true,
         failedOver: fellOver,
@@ -571,7 +875,7 @@ async function runChat(args: ChatArgs): Promise<ChatResult> {
       return { ...out, provider: "anthropic" };
     } catch (e) {
       const err = redactErr(e);
-      logCall({ provider: "anthropic", model, tier, latencyMs: Date.now() - t, ok: false, failedOver: fellOver, err });
+      logCall({ provider: "anthropic", model: paidModel, ...ctx, latencyMs: Date.now() - t, ok: false, failedOver: fellOver, err });
       if (!workersAiRunner()) throw e;
       lastErr = e;
     }
@@ -582,14 +886,14 @@ async function runChat(args: ChatArgs): Promise<ChatResult> {
   const t4 = Date.now();
   try {
     const { out, model: wModel } = await callWorkersAi(args.system, args.messages, maxTokens, args.temperature);
-    logCall({ provider: "workers-ai", model: wModel, tier, latencyMs: Date.now() - t4, ok: true, failedOver: true });
+    logCall({ provider: "workers-ai", model: wModel, ...ctx, usage: out.usage, latencyMs: Date.now() - t4, ok: true, failedOver: true });
     return { ...out, provider: "workers-ai" };
   } catch (e) {
     const err = redactErr(e);
     logCall({
       provider: "workers-ai",
       model: process.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL,
-      tier,
+      ...ctx,
       latencyMs: Date.now() - t4,
       ok: false,
       failedOver: true,
@@ -739,6 +1043,8 @@ export interface ToolChatArgs {
   tools?: ToolDefinition[];
   /** "auto" (default) or "none". Forcing a tool is not offered: OCP refuses it. */
   toolChoice?: "auto" | "none";
+  /** Task key for routing overrides and ai.runs (see ChatArgs.task). */
+  task?: string;
   model?: string;
   tier?: ModelTier;
   /** Defaults to 8192. */
@@ -1058,7 +1364,16 @@ function streamLegs(args: ToolChatArgs, model: string): StreamLeg[] {
  * Unbuffered, failover is possible only until the first event is yielded.
  */
 async function* runStream(args: ToolChatArgs, buffered: boolean): AsyncGenerator<ChatStreamEvent> {
+  try {
+    yield* runStreamLegs(args, buffered);
+  } finally {
+    await flushRuns();
+  }
+}
+
+async function* runStreamLegs(args: ToolChatArgs, buffered: boolean): AsyncGenerator<ChatStreamEvent> {
   const { model, tier } = resolveModel({ system: "", messages: [], model: args.model, tier: args.tier });
+  const task = args.task || `${appName()}.${tableTier(tier)}`;
   const legs = streamLegs(args, model);
   const mode = buffered ? "tools" : "stream";
   let lastErr: unknown = new Error("No LLM provider configured: set ANTHROPIC_API_KEY or OCP_BASE_URL.");
@@ -1074,6 +1389,8 @@ async function* runStream(args: ToolChatArgs, buffered: boolean): AsyncGenerator
         provider: leg.provider,
         model: leg.model,
         tier,
+        task,
+        ...(extra.out ? { usage: extra.out.usage } : {}),
         latencyMs: Date.now() - t,
         ok,
         ...(leg.failedOver ? { failedOver: true } : {}),

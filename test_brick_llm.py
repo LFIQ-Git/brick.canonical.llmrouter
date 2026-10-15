@@ -3,7 +3,7 @@
 Runs with pytest if installed, else as a plain script:
 
     python3 -m test_brick_llm        # from this directory
-    python3 test_brick_llm.py
+    python3 test_L.py
 
 Covers: get_provider env resolution, model/tier resolution, the circuit
 breaker state machine (including half-open after cooldown), and transient-
@@ -290,6 +290,92 @@ def test_ocp_client_options() -> None:
         assert L._ocp_client_options() == {"timeout": 2.5, "max_retries": 0}
     with env(LLM_OCP_TIMEOUT_MS="junk", LLM_OCP_MAX_RETRIES="-1"):
         assert L._ocp_client_options() == {"timeout": 180.0, "max_retries": 1}
+
+
+
+# ── control plane (phase 2) ──────────────────────────────────────────────
+_ROUTES = [
+    {"tier": "fast", "task": None, "primary": {"provider": "ocp", "model": "claude-haiku-4-5"}, "fallback": {"provider": "anthropic", "model": "claude-haiku-4-5"}},
+    {"tier": "standard", "task": None, "primary": {"provider": "ocp", "model": "claude-sonnet-5-5"}, "fallback": {"provider": "anthropic", "model": "claude-sonnet-5-5"}},
+    {"tier": "deep", "task": None, "primary": {"provider": "ocp", "model": "claude-opus-5-5"}, "fallback": None},
+    {"tier": "standard", "task": "keystone.chat", "primary": {"provider": "anthropic", "model": "claude-sonnet-5-5"}, "fallback": None},
+]
+
+
+@contextmanager
+def control(spent: float = 0.0) -> Iterator[list]:
+    posted: list = []
+    orig = L._http_json
+
+    def fake(method, url, headers, body=None):
+        assert headers["x-scheduler-secret"] == "s"
+        if method == "GET":
+            return {"routes": _ROUTES, "daily_paid_cap_usd": "5.00", "today_paid_usd": str(spent)}
+        posted.extend(body["runs"])
+        return {"recorded": len(body["runs"])}
+
+    L._http_json = fake
+    L._ctl.update({"at": 0.0, "routes": None, "cap": None, "spent": None, "queue": []})
+    try:
+        with env(AI_CONTROL_URL="http://ctl/", AI_CONTROL_SECRET="s", LLM_APP_NAME="keystone"):
+            yield posted
+    finally:
+        L._http_json = orig
+        L._ctl.update({"at": 0.0, "routes": None, "cap": None, "spent": None, "queue": []})
+
+
+def test_route_from_table_with_task_and_default_key() -> None:
+    with control():
+        r = L.resolve_route(None, "balanced", None)
+        assert r["source"] == "table" and r["task"] == "keystone.standard"
+        assert r["ocp_model"] == "claude-sonnet-5-5" and r["anthropic_model"] == "claude-sonnet-5-5"
+        assert L.resolve_route("keystone.chat", "balanced", None).get("ocp_model") is None
+
+
+def test_route_deep_has_no_paid_leg() -> None:
+    with control():
+        assert "anthropic_model" not in L.resolve_route("keystone.review", "deep", None)
+
+
+def test_route_budget_step_down_and_hold() -> None:
+    with control(spent=4.2):
+        r = L.resolve_route("keystone.brief", "balanced", None)
+        assert r["budget"] == "step_down" and r["anthropic_model"] == "claude-haiku-4-5"
+    with control(spent=5.0):
+        r = L.resolve_route("keystone.brief", "balanced", None)
+        assert r["budget"] == "held" and "anthropic_model" not in r
+
+
+def test_route_override_and_refusal() -> None:
+    with control(), env(AI_ROUTE_KEYSTONE_BRIEF="anthropic:claude-haiku-4-5"):
+        r = L.resolve_route("keystone.brief", "balanced", None)
+        assert r["source"] == "override" and r.get("ocp_model") is None
+    try:
+        L.parse_route_override("workers-ai:@cf/x")
+        raise AssertionError("expected refusal")
+    except ValueError:
+        pass
+
+
+def test_runs_are_posted() -> None:
+    with control() as posted:
+        route = L.resolve_route("keystone.brief", "balanced", None)
+        L._enqueue_run(route, "ocp", "claude-sonnet-5-5", {"input_tokens": 3, "output_tokens": 2}, 120, True, False, None)
+        L.flush_runs()
+        assert posted == [{"router": "brick", "app": "keystone", "task": "keystone.brief", "tier": "standard",
+                           "provider": "ocp", "model": "claude-sonnet-5-5", "latency_ms": 120, "fell_back": False,
+                           "ok": True, "input_tokens": 3, "output_tokens": 2}]
+
+
+def test_no_control_plane_means_builtin_and_no_runs() -> None:
+    with env(AI_CONTROL_URL=None, AI_CONTROL_SECRET=None):
+        r = L.resolve_route("x.y", "fast", None)
+        assert r["source"] == "builtin"
+
+
+def test_sonnet_55_settings() -> None:
+    assert L.anthropic_text_settings("claude-sonnet-5-5", 900, 0.2) == {"max_tokens": 900, "thinking": {"type": "between_tools"}}
+    assert L.anthropic_text_settings("claude-haiku-4-5", 100, 0.2) == {"max_tokens": 100, "temperature": 0.2}
 
 
 # ── plain-script runner (no pytest required) ─────────────────────────────
