@@ -919,6 +919,9 @@ function toAnthropicMessages(messages) {
     for (const m of messages) {
         if (m.role === "user")
             push("user", m.content ? [{ type: "text", text: m.content }] : []);
+        else if (m.role === "assistant" && Array.isArray(m.providerBlocks) && m.providerBlocks.length) {
+            push("assistant", m.providerBlocks);
+        }
         else if (m.role === "assistant") {
             const blocks = [];
             if (m.content)
@@ -954,6 +957,22 @@ function mapAnthropicStop(r) {
         return "length";
     return "other";
 }
+/**
+ * Thinking and sampling settings for a tool turn. Sonnet 5.5 thinks by default
+ * and rejects sampling settings; `between_tools` keeps it from spending the
+ * answer budget on extended thinking (accepted at effort high or below, and only
+ * when the caller sets no thinking of its own). Haiku 4.x and older models keep
+ * the caller's temperature.
+ */
+function anthropicToolSettings(model, args) {
+    const callerThinking = Boolean(args.anthropic && "thinking" in args.anthropic);
+    if (model === "claude-sonnet-5-5") {
+        return !callerThinking && args.effort !== "xhigh" && args.effort !== "max" ? { thinking: { type: "between_tools" } } : {};
+    }
+    if (/^claude-(opus-5|fable-5|haiku-5)/.test(model))
+        return {};
+    return args.temperature !== undefined ? { temperature: args.temperature } : {};
+}
 async function* anthropicLeg(args, model) {
     const a = getAnthropic();
     const system = typeof args.system === "string"
@@ -970,7 +989,7 @@ async function* anthropicLeg(args, model) {
         max_tokens: args.maxTokens ?? 8192,
         system,
         messages: toAnthropicMessages(args.messages),
-        ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
+        ...anthropicToolSettings(model, args),
         ...(tools.length ? { tools, ...(args.toolChoice === "none" ? { tool_choice: { type: "none" } } : {}) } : {}),
         ...(args.effort ? { output_config: { effort: args.effort } } : {}),
         ...(args.anthropic ?? {}),
@@ -1015,6 +1034,7 @@ async function* anthropicLeg(args, model) {
             raw: final,
             toolCalls,
             finishReason: mapAnthropicStop(final.stop_reason),
+            providerBlocks: final.content,
         },
     };
 }
@@ -1099,7 +1119,17 @@ async function* runStreamLegs(args, buffered) {
             for await (const ev of leg.run()) {
                 let out;
                 if (ev.type === "end") {
-                    result = { ...ev.out, provider: leg.provider, model: leg.model };
+                    result = {
+                        ...ev.out,
+                        provider: leg.provider,
+                        model: leg.model,
+                        message: {
+                            role: "assistant",
+                            content: ev.out.text,
+                            ...(ev.out.toolCalls.length ? { toolCalls: ev.out.toolCalls } : {}),
+                            ...(ev.out.providerBlocks ? { providerBlocks: ev.out.providerBlocks } : {}),
+                        },
+                    };
                     out = { type: "done", result };
                 }
                 else

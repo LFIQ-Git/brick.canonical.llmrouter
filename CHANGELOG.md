@@ -2,6 +2,14 @@
 
 All notable changes to `@lfiq/canonical-llm`. Consumers pin by commit SHA; bump the pin to pick up a release.
 
+## 0.9.1 (2026-10-16)
+
+Tool turns on Sonnet 5.5. Additive.
+
+### Fixed
+- **Thinking blocks are kept between tool rounds.** `chatTools` and `chatStream` threw away the Anthropic thinking blocks when the caller rebuilt the assistant turn. Each result now carries `message`, the assistant turn with its Anthropic content blocks in `providerBlocks`. Append it as is (`messages.push(r.message)`) and the Anthropic leg replays it unchanged. Other legs ignore `providerBlocks`.
+- **Sonnet 5.5 tool turns.** They now send `thinking: {type: "between_tools"}`, unless the caller sets thinking itself or asks for effort above `high`. They also no longer send sampling settings, which Sonnet 5.5 rejects. Opus 5.x, Fable 5 and Haiku 5.x get no sampling settings either.
+
 ## 0.9.0 (2026-10-15)
 
 Phase 2 of the AI Model Usage Plan. Additive, apart from the Sonnet 5.5 change noted below. With no new env vars set, routing is the same as 0.8.0.
