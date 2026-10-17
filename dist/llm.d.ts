@@ -188,6 +188,13 @@ export type ToolChatMessage = {
     role: "assistant";
     content: string;
     toolCalls?: ToolCall[];
+    /**
+     * The Anthropic content blocks of this turn, thinking blocks included. Sent
+     * back unchanged on the Anthropic leg (a model that thinks between tool
+     * calls needs its thinking blocks replayed); other legs ignore it. Set by
+     * `ToolChatResult.message`, so append that instead of rebuilding the turn.
+     */
+    providerBlocks?: unknown[];
 } | {
     role: "tool";
     toolCallId: string;
@@ -229,6 +236,8 @@ export interface ToolChatArgs {
 export interface ToolChatResult extends ChatResult {
     toolCalls: ToolCall[];
     finishReason: FinishReason;
+    /** This turn as an assistant message, ready to append before the tool results. */
+    message: ToolChatMessage;
     /** The model id the answering leg ran. */
     model: string;
 }

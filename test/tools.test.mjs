@@ -315,3 +315,60 @@ test("text API unchanged: chatDetailed still non-streaming", async () => {
   assert.equal(r.text, "plain");
   assert.equal(bodies.ocp[0].stream, undefined);
 });
+
+/** Anthropic stream that opens with a thinking block, then one tool call. */
+const anthThinkingStream = (_q, res) => {
+  sse(res, [
+    aev("message_start", { message: { id: "msg", type: "message", role: "assistant", model: "m", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 9, output_tokens: 0 } } }),
+    aev("content_block_start", { index: 0, content_block: { type: "thinking", thinking: "", signature: "" } }),
+    aev("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: "check the weather tool" } }),
+    aev("content_block_delta", { index: 0, delta: { type: "signature_delta", signature: "sig-abc" } }),
+    aev("content_block_stop", { index: 0 }),
+    aev("content_block_start", { index: 1, content_block: { type: "tool_use", id: "tu9", name: "get_weather", input: {} } }),
+    aev("content_block_delta", { index: 1, delta: { type: "input_json_delta", partial_json: JSON.stringify({ city: "LA" }) } }),
+    aev("content_block_stop", { index: 1 }),
+    aev("message_delta", { delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 4 } }),
+    aev("message_stop", {}),
+  ]);
+};
+
+test("Sonnet 5.5 tool turns: between_tools, no temperature, thinking blocks replayed via result.message", async () => {
+  chainEnv();
+  process.env.LLM_PROVIDER = "anthropic";
+  handlers.anth = anthThinkingStream;
+  const L = await load();
+  const first = await captureLogs(() => L.chatTools({ ...ARGS, model: "claude-sonnet-5-5", temperature: 0.4 }));
+  const r = first.result;
+  const body1 = bodies.anth[0];
+  assert.deepEqual(body1.thinking, { type: "between_tools" });
+  assert.equal(body1.temperature, undefined);
+  assert.equal(r.message.role, "assistant");
+  assert.equal(r.message.providerBlocks[0].type, "thinking");
+  assert.equal(r.message.providerBlocks[0].signature, "sig-abc");
+  assert.deepEqual(r.message.toolCalls, [{ id: "tu9", name: "get_weather", arguments: { city: "LA" } }]);
+
+  handlers.anth = anthStream({ text: "72 and sunny" });
+  await captureLogs(() => L.chatTools({
+    ...ARGS,
+    model: "claude-sonnet-5-5",
+    messages: [...ARGS.messages, r.message, { role: "tool", toolCallId: "tu9", content: "72F" }],
+  }));
+  const replay = bodies.anth[1].messages[1];
+  assert.equal(replay.role, "assistant");
+  assert.equal(replay.content[0].type, "thinking");
+  assert.equal(replay.content[0].signature, "sig-abc");
+  assert.equal(replay.content[1].type, "tool_use");
+  delete process.env.LLM_PROVIDER;
+});
+
+test("Sonnet 5.5 at effort xhigh, or with caller thinking, sends no between_tools", async () => {
+  chainEnv();
+  process.env.LLM_PROVIDER = "anthropic";
+  handlers.anth = anthStream({ text: "ok" });
+  const L = await load();
+  await captureLogs(() => L.chatTools({ ...ARGS, model: "claude-sonnet-5-5", effort: "xhigh" }));
+  assert.equal(bodies.anth[0].thinking, undefined);
+  await captureLogs(() => L.chatTools({ ...ARGS, model: "claude-sonnet-5-5", anthropic: { thinking: { type: "adaptive" } } }));
+  assert.deepEqual(bodies.anth[1].thinking, { type: "adaptive" });
+  delete process.env.LLM_PROVIDER;
+});

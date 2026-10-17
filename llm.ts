@@ -983,7 +983,7 @@ export function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promis
 //   for (;;) {
 //     const r = await chatTools({ system, messages, tools, model });
 //     if (r.finishReason !== "tool_calls") break;
-//     messages.push({ role: "assistant", content: r.text, toolCalls: r.toolCalls });
+//     messages.push(r.message); // keeps thinking blocks for the Anthropic leg
 //     for (const c of r.toolCalls) messages.push({ role: "tool", toolCallId: c.id, content: await run(c) });
 //   }
 //
@@ -1022,7 +1022,18 @@ export interface ToolCall {
 
 export type ToolChatMessage =
   | { role: "user"; content: string }
-  | { role: "assistant"; content: string; toolCalls?: ToolCall[] }
+  | {
+      role: "assistant";
+      content: string;
+      toolCalls?: ToolCall[];
+      /**
+       * The Anthropic content blocks of this turn, thinking blocks included. Sent
+       * back unchanged on the Anthropic leg (a model that thinks between tool
+       * calls needs its thinking blocks replayed); other legs ignore it. Set by
+       * `ToolChatResult.message`, so append that instead of rebuilding the turn.
+       */
+      providerBlocks?: unknown[];
+    }
   | { role: "tool"; toolCallId: string; content: string; isError?: boolean };
 
 /** One part of a multi-part system prompt. `cache_control` marks a prompt-cache
@@ -1061,6 +1072,8 @@ export interface ToolChatArgs {
 export interface ToolChatResult extends ChatResult {
   toolCalls: ToolCall[];
   finishReason: FinishReason;
+  /** This turn as an assistant message, ready to append before the tool results. */
+  message: ToolChatMessage;
   /** The model id the answering leg ran. */
   model: string;
 }
@@ -1095,6 +1108,8 @@ interface LegResult {
   raw: unknown;
   toolCalls: ToolCall[];
   finishReason: FinishReason;
+  /** Anthropic leg only: the turn's content blocks, for replay. */
+  providerBlocks?: unknown[];
 }
 
 function systemText(system: string | SystemPart[]): string {
@@ -1222,7 +1237,9 @@ function toAnthropicMessages(messages: ToolChatMessage[]): AnthropicMsg[] {
   };
   for (const m of messages) {
     if (m.role === "user") push("user", m.content ? [{ type: "text", text: m.content }] : []);
-    else if (m.role === "assistant") {
+    else if (m.role === "assistant" && Array.isArray(m.providerBlocks) && m.providerBlocks.length) {
+      push("assistant", m.providerBlocks as AnthropicBlock[]);
+    } else if (m.role === "assistant") {
       const blocks: AnthropicBlock[] = [];
       if (m.content) blocks.push({ type: "text", text: m.content });
       for (const c of m.toolCalls ?? []) blocks.push({ type: "tool_use", id: c.id, name: c.name, input: c.arguments ?? {} });
@@ -1252,6 +1269,22 @@ function mapAnthropicStop(r: string | null | undefined): FinishReason {
   return "other";
 }
 
+/**
+ * Thinking and sampling settings for a tool turn. Sonnet 5.5 thinks by default
+ * and rejects sampling settings; `between_tools` keeps it from spending the
+ * answer budget on extended thinking (accepted at effort high or below, and only
+ * when the caller sets no thinking of its own). Haiku 4.x and older models keep
+ * the caller's temperature.
+ */
+function anthropicToolSettings(model: string, args: ToolChatArgs): Record<string, unknown> {
+  const callerThinking = Boolean(args.anthropic && "thinking" in args.anthropic);
+  if (model === "claude-sonnet-5-5") {
+    return !callerThinking && args.effort !== "xhigh" && args.effort !== "max" ? { thinking: { type: "between_tools" } } : {};
+  }
+  if (/^claude-(opus-5|fable-5|haiku-5)/.test(model)) return {};
+  return args.temperature !== undefined ? { temperature: args.temperature } : {};
+}
+
 async function* anthropicLeg(args: ToolChatArgs, model: string): AsyncGenerator<LegEvent> {
   const a = getAnthropic();
   const system =
@@ -1269,7 +1302,7 @@ async function* anthropicLeg(args: ToolChatArgs, model: string): AsyncGenerator<
     max_tokens: args.maxTokens ?? 8192,
     system,
     messages: toAnthropicMessages(args.messages),
-    ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
+    ...anthropicToolSettings(model, args),
     ...(tools.length ? { tools, ...(args.toolChoice === "none" ? { tool_choice: { type: "none" } } : {}) } : {}),
     ...(args.effort ? { output_config: { effort: args.effort } } : {}),
     ...(args.anthropic ?? {}),
@@ -1311,6 +1344,7 @@ async function* anthropicLeg(args: ToolChatArgs, model: string): AsyncGenerator<
       raw: final,
       toolCalls,
       finishReason: mapAnthropicStop(final.stop_reason),
+      providerBlocks: final.content as unknown[],
     },
   };
 }
@@ -1406,7 +1440,17 @@ async function* runStreamLegs(args: ToolChatArgs, buffered: boolean): AsyncGener
       for await (const ev of leg.run()) {
         let out: ChatStreamEvent;
         if (ev.type === "end") {
-          result = { ...ev.out, provider: leg.provider, model: leg.model };
+          result = {
+            ...ev.out,
+            provider: leg.provider,
+            model: leg.model,
+            message: {
+              role: "assistant",
+              content: ev.out.text,
+              ...(ev.out.toolCalls.length ? { toolCalls: ev.out.toolCalls } : {}),
+              ...(ev.out.providerBlocks ? { providerBlocks: ev.out.providerBlocks } : {}),
+            },
+          };
           out = { type: "done", result };
         } else out = ev;
         if (buffered) pending.push(out);
