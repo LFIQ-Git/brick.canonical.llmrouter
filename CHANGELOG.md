@@ -2,6 +2,14 @@
 
 All notable changes to `@lfiq/canonical-llm`. Consumers pin by commit SHA; bump the pin to pick up a release.
 
+## 0.10.0 (2026-10-20)
+
+The paid Anthropic leg goes through the Cloudflare AI Gateway. Additive.
+
+- With `AI_GATEWAY_TOKEN` set, `getAnthropic()` (TS) and `_get_anthropic()` (Python) call the Left Field gateway `default` with `cf-aig-authorization` and no `x-api-key`, so the gateway's stored Anthropic key, call logs and spend limit apply. `AI_GATEWAY_URL` overrides the endpoint.
+- The Anthropic leg runs when either `AI_GATEWAY_TOKEN` or `ANTHROPIC_API_KEY` is set (`anthropicConfigured()` / `anthropic_configured()`).
+- The gateway token is redacted from errors.
+
 ## 0.9.1 (2026-10-16)
 
 Tool turns on Sonnet 5.5. Additive.

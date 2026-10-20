@@ -13,7 +13,8 @@
  *                      paid Anthropic API. Intermediate failover for the OCP
  *                      path when OCP_FALLBACK_BASE_URL + OCP_FALLBACK_API_KEY
  *                      are set. Kills the Win-PC single-point-of-failure.
- *   - "anthropic"    — Anthropic SDK directly with ANTHROPIC_API_KEY. Last
+ *   - "anthropic"    — Anthropic SDK, through the Cloudflare AI Gateway when
+ *                      AI_GATEWAY_TOKEN is set, else directly with ANTHROPIC_API_KEY. Last
  *                      paid leg on the OCP chain, and the primary when
  *                      LLM_PROVIDER=anthropic.
  *   - "workers-ai"   — Cloudflare Workers AI through the calling Worker's own
@@ -159,12 +160,41 @@ function getOpenAIFallback() {
     });
     return _oaiFallback;
 }
+/** The Left Field Cloudflare AI Gateway's Anthropic endpoint (gateway "default"). */
+export const DEFAULT_AI_GATEWAY_URL = "https://gateway.ai.cloudflare.com/v1/c16c7246ee0a89e6deafe19a74480c6a/default/anthropic";
+/** True when the paid Anthropic leg can run: through the AI Gateway, or directly with a key. */
+export function anthropicConfigured() {
+    return Boolean(process.env.AI_GATEWAY_TOKEN?.trim() || process.env.ANTHROPIC_API_KEY);
+}
+/**
+ * The paid Anthropic client. With AI_GATEWAY_TOKEN set, calls go through the
+ * Cloudflare AI Gateway, which holds the Anthropic key, logs every call and
+ * enforces the spend limit; the request carries the gateway token and no
+ * x-api-key, so the gateway's stored key is used. Otherwise it calls Anthropic
+ * directly with ANTHROPIC_API_KEY. Env: AI_GATEWAY_TOKEN, AI_GATEWAY_URL.
+ */
 function getAnthropic() {
     if (_anthropic)
         return _anthropic;
+    const token = process.env.AI_GATEWAY_TOKEN?.trim();
+    if (token) {
+        const baseFetch = (input, init) => fetch(input, init);
+        _anthropic = new Anthropic({
+            apiKey: "gateway",
+            baseURL: process.env.AI_GATEWAY_URL?.trim() || DEFAULT_AI_GATEWAY_URL,
+            defaultHeaders: { "cf-aig-authorization": `Bearer ${token}` },
+            fetch: (input, init) => {
+                const headers = new Headers(init?.headers);
+                headers.delete("x-api-key");
+                return baseFetch(input, { ...init, headers });
+            },
+            ...anthropicClientOptions(),
+        });
+        return _anthropic;
+    }
     const apiKey = process.env.ANTHROPIC_API_KEY ?? "";
     if (!apiKey) {
-        throw new Error("ANTHROPIC_API_KEY not set. Set OCP_BASE_URL to use the subscription proxy instead.");
+        throw new Error("Neither AI_GATEWAY_TOKEN nor ANTHROPIC_API_KEY is set. Set OCP_BASE_URL to use the subscription proxy instead.");
     }
     _anthropic = new Anthropic({ apiKey, ...anthropicClientOptions() });
     return _anthropic;
@@ -388,6 +418,7 @@ const SECRET_ENV_NAMES = [
     "OCP_CF_ACCESS_CLIENT_SECRET",
     "OCP_FALLBACK_API_KEY",
     "ANTHROPIC_API_KEY",
+    "AI_GATEWAY_TOKEN",
 ];
 const ERR_MAX_CHARS = 300;
 // [pattern, replacement] — replacements keep the label, drop the value.
@@ -395,7 +426,7 @@ const TOKEN_PATTERNS = [
     [/sk-[A-Za-z0-9_-]{8,}/g, "[redacted]"], // Anthropic / OpenAI-style keys
     [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]"], // auth header values
     [
-        /\b(api[_-]?key|x-api-key|authorization|cf-access-client-secret|cf-access-client-id)(["']?\s*[:=]\s*["']?)[^\s"',}]{6,}/gi,
+        /\b(api[_-]?key|x-api-key|cf-aig-authorization|authorization|cf-access-client-secret|cf-access-client-id)(["']?\s*[:=]\s*["']?)[^\s"',}]{6,}/gi,
         "$1$2[redacted]",
     ],
 ];
@@ -617,7 +648,7 @@ async function runChatLegs(args) {
     const primary = getProvider();
     const ocpModel = route.ocpModel;
     const paidModel = route.anthropicModel;
-    const anthropicAvailable = Boolean(process.env.ANTHROPIC_API_KEY) && Boolean(paidModel);
+    const anthropicAvailable = anthropicConfigured() && Boolean(paidModel);
     const fallbackAvailable = ocpFallbackConfigured() && Boolean(paidModel);
     const ctx = { tier, task, routeTier };
     // ── Leg 1: OCP (Win-PC) ────────────────────────────────────────────────
@@ -1059,7 +1090,7 @@ function streamLegs(args, model) {
             legs.push({ provider: "ocp-fallback", model, failedOver: true, breaker: _ocpFallbackBreaker, run: () => openAIShapeLeg(getOpenAIFallback(), args, model) });
         }
     }
-    if (process.env.ANTHROPIC_API_KEY) {
+    if (anthropicConfigured()) {
         legs.push({ provider: "anthropic", model, failedOver: primary === "ocp", run: () => anthropicLeg(args, model) });
     }
     if (workersAiRunner() && !args.tools?.length) {
