@@ -7,6 +7,10 @@ export declare const MODEL_TIERS: Record<ModelTier, string>;
 /** Default model when neither `model` nor `tier` is given. */
 export declare const DEFAULT_LLM_MODEL: string;
 export declare function getProvider(): Provider;
+/** The Left Field Cloudflare AI Gateway's Anthropic endpoint (gateway "default"). */
+export declare const DEFAULT_AI_GATEWAY_URL = "https://gateway.ai.cloudflare.com/v1/c16c7246ee0a89e6deafe19a74480c6a/default/anthropic";
+/** True when the paid Anthropic leg can run: through the AI Gateway, or directly with a key. */
+export declare function anthropicConfigured(): boolean;
 export interface ChatMessage {
     role: "user" | "assistant";
     content: string;

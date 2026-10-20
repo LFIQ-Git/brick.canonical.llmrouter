@@ -180,10 +180,41 @@ def _get_openai() -> Any:
     return _oai
 
 
+DEFAULT_AI_GATEWAY_URL = (
+    "https://gateway.ai.cloudflare.com/v1/c16c7246ee0a89e6deafe19a74480c6a/default/anthropic"
+)
+
+
+def anthropic_configured() -> bool:
+    """True when the paid Anthropic leg can run: through the AI Gateway, or directly with a key."""
+    return bool((os.environ.get("AI_GATEWAY_TOKEN") or "").strip() or os.environ.get("ANTHROPIC_API_KEY"))
+
+
+def _drop_api_key(request: Any) -> None:
+    # The gateway uses the Anthropic key it stores only when the request carries none.
+    request.headers.pop("x-api-key", None)
+
+
 def _get_anthropic() -> Any:
-    """Lazily construct (and memoize) the Anthropic-SDK client."""
+    """Lazily construct (and memoize) the Anthropic-SDK client.
+
+    With AI_GATEWAY_TOKEN set, calls go through the Cloudflare AI Gateway (twin
+    of ``getAnthropic`` in llm.ts); otherwise directly with ANTHROPIC_API_KEY.
+    """
     global _anthropic
     if _anthropic is not None:
+        return _anthropic
+    token = (os.environ.get("AI_GATEWAY_TOKEN") or "").strip()
+    if token:
+        import anthropic  # lazy import — see module docstring
+
+        _anthropic = anthropic.Anthropic(
+            api_key="gateway",
+            base_url=(os.environ.get("AI_GATEWAY_URL") or DEFAULT_AI_GATEWAY_URL).strip(),
+            default_headers={"cf-aig-authorization": f"Bearer {token}"},
+            http_client=anthropic.DefaultHttpxClient(event_hooks={"request": [_drop_api_key]}),
+            **_anthropic_client_options(),
+        )
         return _anthropic
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -466,6 +497,7 @@ _SECRET_ENV_NAMES = (
     "OCP_CF_ACCESS_CLIENT_SECRET",
     "OCP_FALLBACK_API_KEY",
     "ANTHROPIC_API_KEY",
+    "AI_GATEWAY_TOKEN",
 )
 _ERR_MAX_CHARS = 300
 _TOKEN_PATTERNS = (
@@ -473,7 +505,7 @@ _TOKEN_PATTERNS = (
     (re.compile(r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}", re.I), r"\1 [redacted]"),
     (
         re.compile(
-            r"\b(api[_-]?key|x-api-key|authorization|cf-access-client-secret|cf-access-client-id)"
+            r"\b(api[_-]?key|x-api-key|cf-aig-authorization|authorization|cf-access-client-secret|cf-access-client-id)"
             r"([\"']?\s*[:=]\s*[\"']?)[^\s\"',}]{6,}",
             re.I,
         ),
@@ -660,7 +692,7 @@ def _run_chat_legs(args: ChatArgs) -> ChatResult:
     paid_model = route.get("anthropic_model")
     max_tokens = args.max_tokens if args.max_tokens is not None else 8192
     primary = get_provider()
-    anthropic_available = bool(os.environ.get("ANTHROPIC_API_KEY")) and bool(paid_model)
+    anthropic_available = anthropic_configured() and bool(paid_model)
 
     if primary == "ocp" and ocp_model and not _ocp_breaker_open():
         started = _now_ms()
